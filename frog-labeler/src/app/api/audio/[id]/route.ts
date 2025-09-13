@@ -1,15 +1,16 @@
+export const runtime = "nodejs";
+
 import { NextResponse } from "next/server";
 import { db } from "@/lib/db";
 
-// In Next 15, params can be a Promise in route handlers.
-// Take `params` as a Promise and await it.
-export async function GET(
-  _req: Request,
-  ctx: { params: Promise<{ id: string }> }
-) {
-  const { id } = await ctx.params;
+type Ctx = { params: { id: string } };
 
-  const audio = await db.audioFile.findUnique({ where: { id } });
-  if (!audio) return NextResponse.json({ error: "Not found" }, { status: 404 });
+export async function GET(_req: Request, { params }: Ctx) {
+  const audio = await db.audioFile.findUnique({
+    where: { id: params.id },
+  });
+  if (!audio) {
+    return NextResponse.json({ error: "Not found" }, { status: 404 });
+  }
   return NextResponse.json(audio);
 }

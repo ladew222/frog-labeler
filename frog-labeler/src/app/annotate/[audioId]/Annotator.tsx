@@ -1,11 +1,10 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, useCallback } from "react";
+import Link from "next/link";
 import WaveSurfer from "wavesurfer.js";
 import RegionsPlugin from "wavesurfer.js/dist/plugins/regions.esm.js";
 import SpectrogramPlugin from "wavesurfer.js/dist/plugins/spectrogram.esm.js";
-import Link from "next/link";
-
 
 type AudioRow = { id: string; originalName: string; uri: string; recordedAt: string | null };
 type LabelRow = { id: string; name: string; hotkey: string | null; color?: string | null };
@@ -29,8 +28,8 @@ async function fetchLabels(): Promise<LabelRow[]> {
   return r.json();
 }
 async function fetchSegments(audioId: string): Promise<SegmentRow[]> {
-  const r = await fetch(`/api/segments/${audioId}`, { cache: "no-store" });
-  if (!r.ok) throw new Error(`GET /api/segments/${audioId} -> ${r.status}`);
+  const r = await fetch(`/api/audio/${audioId}/segments`, { cache: "no-store" });
+  if (!r.ok) throw new Error(`GET /api/audio/${audioId}/segments -> ${r.status}`);
   return r.json();
 }
 
@@ -40,7 +39,6 @@ export default function Annotator({ audioId }: { audioId: string }) {
   const wsRef = useRef<WaveSurfer | null>(null);
   const regionsRef = useRef<ReturnType<typeof RegionsPlugin.create> | null>(null);
 
-  // The dedicated green "pending" region we keep in sync with sliders
   const pendingId = "__pending";
 
   const [audio, setAudio] = useState<AudioRow | null>(null);
@@ -55,7 +53,6 @@ export default function Annotator({ audioId }: { audioId: string }) {
   const [saving, setSaving] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
 
-  // ------- Load metadata -------
   useEffect(() => {
     (async () => {
       try {
@@ -86,7 +83,7 @@ export default function Annotator({ audioId }: { audioId: string }) {
     return m;
   }, [labels]);
 
-  // ------- Init WaveSurfer + plugins -------
+  // ----- WaveSurfer init -----
   useEffect(() => {
     if (!audio || !containerRef.current || !spectroRef.current) return;
 
@@ -115,168 +112,136 @@ export default function Annotator({ audioId }: { audioId: string }) {
     ws.load(audio.uri);
 
     ws.on("error", (e: any) => {
-      if (e?.name === "AbortError") return; // ignore teardown aborts
+      if (e?.name === "AbortError") return;
       console.error("WaveSurfer error:", e);
     });
 
     ws.on("ready", () => {
       const d = ws.getDuration() || 0;
       setDuration(d);
-      // initialize selection to first second (visible + valid)
       const start = 0;
       const end = Math.min(1, Math.max(0.05, d));
       setSelStart(start);
       setSelEnd(end);
       syncPendingRegion(start, end);
 
-      // draw existing segments
+      // draw saved regions
       for (const s of segments) {
         const base = s.label.color ?? "#22c55e";
-        const col =
-            base.startsWith("rgba") || base.startsWith("rgb")
-            ? base
-            : baseToRgba(base, 0.25);
-
+        const col = base.startsWith("rgba") || base.startsWith("rgb") ? base : baseToRgba(base, 0.25);
         regions.addRegion({
-            start: s.startS,
-            end: s.endS,
-            color: col,
-            content: chipEl(s.label.name, base),
-            drag: false,
-            resize: false,
+          id: "seg_" + s.id,
+          start: s.startS,
+          end: s.endS,
+          color: col,
+          content: chipEl(s.label.name, base),
+          drag: false,
+          resize: false,
         });
-        }
-
+      }
     });
 
-    // Keyboard
     const onKey = (e: KeyboardEvent) => {
-      if (e.code === "Space") {
-        e.preventDefault();
-        ws.playPause();
-        return;
-      }
+      if (e.code === "Space") { e.preventDefault(); ws.playPause(); return; }
       if (e.key === "[") {
         const t = ws.getCurrentTime();
         const end = Math.max(t + 0.05, selEnd);
-        setSelStart(Math.min(t, end - 0.01));
-        setSelEnd(end);
-        syncPendingRegion(Math.min(t, end - 0.01), end);
-        return;
+        const s = Math.min(t, end - 0.01);
+        setSelStart(s); setSelEnd(end); syncPendingRegion(s, end); return;
       }
       if (e.key === "]") {
         const t = ws.getCurrentTime();
-        const start = Math.min(t, selStart);
-        setSelStart(start);
-        setSelEnd(Math.max(t, start + 0.05));
-        syncPendingRegion(start, Math.max(t, start + 0.05));
-        return;
+        const s = Math.min(t, selStart);
+        const e2 = Math.max(t, s + 0.05);
+        setSelStart(s); setSelEnd(e2); syncPendingRegion(s, e2); return;
       }
-      if (e.key === "l") {
-        ws.play(selStart, selEnd);
-        return;
-      }
+      if (e.key === "l") { ws.play(selStart, selEnd); return; }
       const labelId = hotkeyToLabelId[e.key];
-      if (labelId) {
-        e.preventDefault();
-        void saveCurrentSelection(labelId);
-      }
+      if (labelId) { e.preventDefault(); void saveCurrentSelection(labelId); }
     };
-
     window.addEventListener("keydown", onKey);
 
-    // Cleanup
     return () => {
       window.removeEventListener("keydown", onKey);
       try {
         // @ts-ignore
         const el: HTMLMediaElement | undefined = ws.getMediaElement?.();
-        if (el) {
-          el.pause();
-          el.src = "";
-          el.load();
-        }
+        if (el) { el.pause(); el.src = ""; el.load(); }
         ws.unAll();
-        setTimeout(() => {
-            try {
-                // wavesurfer might throw an AbortError — safe to ignore
-                ws.destroy();
-            } catch (err: any) {
-                if (err?.name !== "AbortError") console.error("WaveSurfer destroy error:", err);
-            }
-        }, 0);
-
+        setTimeout(() => { try { ws.destroy(); } catch (err:any) {
+          if (err?.name !== "AbortError") console.error(err);
+        }}, 0);
       } catch {}
       wsRef.current = null;
       regionsRef.current = null;
     };
-  }, [audio, segments, hotkeyToLabelId]); // sliders not deps here—handled below
+  }, [audio, hotkeyToLabelId]);
+
   // keep a single pending region instance
-const pendingRegionRef = useRef<any>(null);
+  const pendingRegionRef = useRef<any>(null);
 
-
-function syncPendingRegion(start: number, end: number) {
+  // Re-render saved segments when `segments` changes
+useEffect(() => {
   const regions = regionsRef.current;
-  if (!regions) return;
+  const ws = wsRef.current;
+  if (!regions || !ws) return;
 
-  const minLen = 0.02;
-  const s = Math.max(0, Math.min(start, end - minLen));
-  const e = Math.max(s + minLen, end);
+  // Remove existing saved regions (but keep the pending one)
+  regions.getRegions().forEach((r: any) => {
+    if (r.id && String(r.id).startsWith("seg_")) r.remove();
+  });
 
-  const el = chipEl("pending", "rgba(34,197,94,0.5)");
-
-  // update existing pending if we have it
-  const r = pendingRegionRef.current;
-  if (r && typeof r.update === "function") {
-    r.update({
-      start: s,
-      end: e,
-      color: "rgba(34,197,94,0.28)",
-      content: el,            // ← use element, not HTML string
-      drag: true,
-      resize: true,
+  // Draw current saved segments
+  for (const s of segments) {
+    const base = s.label.color ?? "#22c55e";
+    const col = base.startsWith("rgba") || base.startsWith("rgb")
+      ? base
+      : baseToRgba(base, 0.25);
+    regions.addRegion({
+      id: "seg_" + s.id,
+      start: s.startS,
+      end: s.endS,
+      color: col,
+      content: chipEl(s.label.name, base),
+      drag: false,
+      resize: false,
     });
-    return;
   }
 
-  // otherwise ensure no stray pending regions exist, then create one
-  regions.getRegions().forEach((rg: any) => {
-    if (rg.id === pendingId) rg.remove();
-  });
+  // Ensure pending selection stays synced
+  if (duration > 0) syncPendingRegion(selStart, selEnd);
+}, [segments, duration]);  // only redraw on segment list or duration change
 
-  const created = regions.addRegion({
-    id: pendingId,
-    start: s,
-    end: e,
-    color: "rgba(34,197,94,0.28)",
-    content: el,              // ← use element
-    drag: true,
-    resize: true,
-  });
 
-  pendingRegionRef.current = created;
-}
+  function syncPendingRegion(start: number, end: number) {
+    const regions = regionsRef.current;
+    if (!regions) return;
 
-function clearPending() {
-  if (pendingRegionRef.current) {
-    try { pendingRegionRef.current.remove(); } catch {}
+    const minLen = 0.02;
+    const s = Math.max(0, Math.min(start, end - minLen));
+    const e = Math.max(s + minLen, end);
+    const el = chipEl("pending", "rgba(34,197,94,0.5)");
+
+    const r = pendingRegionRef.current;
+    if (r && typeof r.update === "function") {
+      r.update({ start: s, end: e, color: "rgba(34,197,94,0.28)", content: el, drag: true, resize: true });
+      return;
+    }
+    regions.getRegions().forEach((rg: any) => { if (rg.id === pendingId) rg.remove(); });
+    const created = regions.addRegion({
+      id: pendingId, start: s, end: e, color: "rgba(34,197,94,0.28)", content: el, drag: true, resize: true,
+    });
+    pendingRegionRef.current = created;
   }
-  pendingRegionRef.current = null;
-  setSelStart((s) => s); // no-op; leave sliders as-is
-  setSelEnd((e) => e);
-}
 
+  function clearPending() {
+    try { pendingRegionRef.current?.remove(); } catch {}
+    pendingRegionRef.current = null;
+  }
 
+  useEffect(() => { if (duration > 0) syncPendingRegion(selStart, selEnd); }, [selStart, selEnd, duration]);
 
-
-  // update region when sliders change
-  useEffect(() => {
-    if (duration > 0) syncPendingRegion(selStart, selEnd);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selStart, selEnd, duration]);
-
-  // ------- Save selection -------
-    async function saveCurrentSelection(labelId: string) {
+  async function saveCurrentSelection(labelId: string) {
     if (!audio) return;
     const start = Math.max(0, selStart);
     const end = Math.min(duration || selEnd, selEnd);
@@ -284,42 +249,64 @@ function clearPending() {
 
     setSaving(true);
     try {
-        const res = await fetch("/api/segments", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ audioId: audio.id, startS: start, endS: end, labelId }),
-        });
-        if (!res.ok) throw new Error(`POST /api/segments -> ${res.status}`);
-        const saved: SegmentRow = await res.json();
+      const res = await fetch(
+        // NOTE: backticks so `${audio.id}` interpolates
+        `/api/audio/${audio.id}/segments`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ audioId: audio.id, startS: start, endS: end, labelId }),
+        },
+      );
+      if (!res.ok) throw new Error(`POST /api/audio/${audio.id}/segments -> ${res.status}`);
+      const saved: SegmentRow = await res.json();
 
-        // Draw final region (locked, semi‑transparent)
-        const base = labelById[labelId]?.color ?? "#22c55e";
-        const col =
-        base.startsWith("rgba") || base.startsWith("rgb")
-            ? base
-            : baseToRgba(base, 0.25);
+      const base = labelById[labelId]?.color ?? "#22c55e";
+      const col = base.startsWith("rgba") || base.startsWith("rgb") ? base : baseToRgba(base, 0.25);
 
-        regionsRef.current?.addRegion({
-        start,
-        end,
-        color: col,
+      regionsRef.current?.addRegion({
+        id: "seg_" + saved.id,
+        start, end, color: col,
         content: chipEl(labelById[labelId]?.name ?? "label", base),
-        drag: false,
-        resize: false,
-        });
+        drag: false, resize: false,
+      });
 
-        clearPending();
-        setSegments((prev) => [...prev, { ...saved, label: { ...labelById[labelId] } as any }]);
-        setToast("Saved ✓");
-        setTimeout(() => setToast(null), 1000);
+      clearPending();
+      setSegments((prev) => [...prev, { ...saved, label: { ...labelById[labelId] } as any }]);
+      setToast("Saved ✓");
+      setTimeout(() => setToast(null), 1000);
     } catch (e) {
-        console.error(e);
-        setToast("Save failed");
-        setTimeout(() => setToast(null), 1200);
+      console.error(e);
+      setToast("Save failed");
+      setTimeout(() => setToast(null), 1200);
     } finally {
-        setSaving(false);
+      setSaving(false);
     }
+  }
+
+  // delete handler INSIDE the component
+  const handleDelete = useCallback(async (segmentId: string) => {
+    if (!confirm("Delete this segment?")) return;
+    try {
+      const res = await fetch(`/api/segments/${segmentId}`, { method: "DELETE" });
+      if (!res.ok && res.status !== 204) throw new Error(`DELETE /api/segments/${segmentId} -> ${res.status}`);
+
+      let region: any;
+      // @ts-ignore
+      if (regionsRef.current?.getRegion) {
+        // @ts-ignore
+        region = regionsRef.current.getRegion("seg_" + segmentId);
+      } else {
+        region = regionsRef.current?.getRegions()?.find((r: any) => r.id === "seg_" + segmentId);
+      }
+      try { region?.remove(); } catch {}
+
+      setSegments((prev) => prev.filter((s) => s.id !== segmentId));
+    } catch (e) {
+      console.error(e);
+      alert("Failed to delete segment");
     }
+  }, []);
 
   const fmt = (x?: number | null) => (x == null ? "—" : x.toFixed(2));
 
@@ -328,9 +315,9 @@ function clearPending() {
 
   return (
     <div className="p-6 space-y-4">
-    <Link href="/" className="inline-block text-blue-600 underline hover:text-blue-800 text-sm">
+      <Link href="/" className="inline-block text-blue-600 underline hover:text-blue-800 text-sm">
         ← Back to file list
-    </Link>
+      </Link>
 
       <h1 className="text-xl font-semibold">
         Annotate: <span className="font-mono">{audio.originalName}</span>
@@ -339,17 +326,13 @@ function clearPending() {
       <div ref={containerRef} className="rounded border relative" />
       <div ref={spectroRef} className="rounded border" />
 
-      {/* Selection controls (sliders) */}
+      {/* Selection controls */}
       <div className="text-sm border rounded p-3 space-y-2">
         <div className="flex items-center gap-3">
           <button type="button" className="border px-2 py-1 rounded" onClick={() => wsRef.current?.playPause()}>
             ▶/⏸
           </button>
-          <button
-            type="button"
-            className="border px-2 py-1 rounded"
-            onClick={() => wsRef.current?.play(selStart, selEnd)}
-          >
+          <button type="button" className="border px-2 py-1 rounded" onClick={() => wsRef.current?.play(selStart, selEnd)}>
             Loop sel
           </button>
           <span className="text-slate-600 ml-2">
@@ -361,22 +344,13 @@ function clearPending() {
           <label className="flex items-center gap-2">
             Start
             <input
-              type="range"
-              min={0}
-              max={Math.max(0.01, duration)}
-              step={0.01}
-              value={selStart}
-              onChange={(e) => {
-                const v = Math.min(parseFloat(e.target.value), selEnd - 0.01);
-                setSelStart(Math.max(0, v));
-              }}
+              type="range" min={0} max={Math.max(0.01, duration)} step={0.01} value={selStart}
+              onChange={(e) => { const v = Math.min(parseFloat(e.target.value), selEnd - 0.01); setSelStart(Math.max(0, v)); }}
               className="w-full"
             />
             <code>{fmt(selStart)}</code>
             <button
-              type="button"
-              className="border px-1 py-0.5 rounded"
-              title="Set from playhead ["
+              type="button" className="border px-1 py-0.5 rounded" title="Set from playhead ["
               onClick={() => {
                 const t = wsRef.current?.getCurrentTime() ?? selStart;
                 const v = Math.min(t, selEnd - 0.01);
@@ -390,22 +364,13 @@ function clearPending() {
           <label className="flex items-center gap-2">
             End
             <input
-              type="range"
-              min={0}
-              max={Math.max(0.01, duration)}
-              step={0.01}
-              value={selEnd}
-              onChange={(e) => {
-                const v = Math.max(parseFloat(e.target.value), selStart + 0.01);
-                setSelEnd(Math.min(duration || v, v));
-              }}
+              type="range" min={0} max={Math.max(0.01, duration)} step={0.01} value={selEnd}
+              onChange={(e) => { const v = Math.max(parseFloat(e.target.value), selStart + 0.01); setSelEnd(Math.min(duration || v, v)); }}
               className="w-full"
             />
             <code>{fmt(selEnd)}</code>
             <button
-              type="button"
-              className="border px-1 py-0.5 rounded"
-              title="Set from playhead ]"
+              type="button" className="border px-1 py-0.5 rounded" title="Set from playhead ]"
               onClick={() => {
                 const t = wsRef.current?.getCurrentTime() ?? selEnd;
                 const v = Math.max(t, selStart + 0.01);
@@ -450,6 +415,7 @@ function clearPending() {
                 <th className="text-left p-2 border">Start (s)</th>
                 <th className="text-left p-2 border">End (s)</th>
                 <th className="text-left p-2 border">Label</th>
+                <th className="text-left p-2 border">Actions</th>
               </tr>
             </thead>
             <tbody>
@@ -460,12 +426,18 @@ function clearPending() {
                     <td className="p-2 border font-mono">{s.startS.toFixed(2)}</td>
                     <td className="p-2 border font-mono">{s.endS.toFixed(2)}</td>
                     <td className="p-2 border">
-                      <span
-                        className="px-2 py-0.5 rounded"
-                        style={{ background: s.label?.color ?? "rgba(34,197,94,0.25)" }}
-                      >
+                      <span className="px-2 py-0.5 rounded" style={{ background: s.label?.color ?? "rgba(34,197,94,0.25)" }}>
                         {s.label?.name ?? s.labelId}
                       </span>
+                    </td>
+                    <td className="p-2 border">
+                      <button
+                        type="button"
+                        className="border px-2 py-0.5 rounded text-red-600 hover:bg-red-50"
+                        onClick={() => handleDelete(s.id)}
+                      >
+                        Delete
+                      </button>
                     </td>
                   </tr>
                 ))}
@@ -476,18 +448,19 @@ function clearPending() {
 
       <div className="text-xs text-slate-600">
         Shortcuts:
-        <kbd className="border px-1 rounded ml-1">[</kbd> start from playhead,
-        <kbd className="border px-1 rounded ml-1">]</kbd> end from playhead,
-        <kbd className="border px-1 rounded ml-1">Space</kbd> play/pause,
-        <kbd className="border px-1 rounded ml-1">L</kbd> loop selection,
-        label hotkeys: {labels.filter((l) => l.hotkey).map((l) => l!.hotkey).join(", ") || "—"}
+        <kbd className="border px-1 rounded ml-1">[</kbd> start,{" "}
+        <kbd className="border px-1 rounded ml-1">]</kbd> end,{" "}
+        <kbd className="border px-1 rounded ml-1">Space</kbd> play/pause,{" "}
+        <kbd className="border px-1 rounded ml-1">L</kbd> loop, hotkeys:{" "}
+        {labels.filter((l) => l.hotkey).map((l) => l!.hotkey).join(", ") || "—"}
       </div>
     </div>
   );
 }
+
 function chipEl(text: string, bg: string) {
   const el = document.createElement("span");
-  el.textContent = text;                 // safe text (no HTML)
+  el.textContent = text;
   el.style.padding = "2px 6px";
   el.style.borderRadius = "6px";
   el.style.background = bg;
@@ -498,6 +471,7 @@ function chipEl(text: string, bg: string) {
   el.style.pointerEvents = "none";
   return el;
 }
+
 function baseToRgba(hex: string, alpha: number) {
   const shorthand = /^#?([a-f\d])([a-f\d])([a-f\d])$/i;
   const full = hex.replace(shorthand, (_, r, g, b) => r + r + g + g + b + b);
