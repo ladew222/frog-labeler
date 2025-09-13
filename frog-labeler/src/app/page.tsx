@@ -1,7 +1,14 @@
 // src/app/page.tsx
+export const runtime = "nodejs";        // Prisma needs Node runtime
+export const dynamic = "force-dynamic"; // render on each request (no ISR)
+export const revalidate = 0;
+
 import Link from "next/link";
 import { db } from "@/lib/db";
+import type { Prisma } from "@prisma/client";
 
+type SortKey = "recordedAt" | "originalName" | "site" | "unitId";
+type Dir = "asc" | "desc";
 type SP = {
   page?: string;
   size?: string;
@@ -13,10 +20,9 @@ type SP = {
 export default async function Home({
   searchParams,
 }: {
-  // Next 13–15 app router: searchParams can be a Promise
   searchParams?: Promise<SP> | SP;
 }) {
-  const sp = (await Promise.resolve(searchParams)) || {};
+  const sp = (await Promise.resolve(searchParams)) ?? {};
 
   // ---- paging
   const page = Math.max(1, Number(sp.page ?? 1) || 1);
@@ -24,39 +30,39 @@ export default async function Home({
   const skip = (page - 1) * size;
 
   // ---- sorting (whitelist)
-  const allowedSorts = {
-    recordedAt: "recordedAt",
-    originalName: "originalName",
-    site: "site",
-    unitId: "unitId",
-  } as const;
-  const sortKey = (allowedSorts[sp.sort as keyof typeof allowedSorts] ??
-    "recordedAt") as keyof typeof allowedSorts;
-  const dir: "asc" | "desc" = sp.dir === "asc" || sp.dir === "desc" ? sp.dir : "asc";
+  const allowedSorts: SortKey[] = ["recordedAt", "originalName", "site", "unitId"];
+  const sortKey: SortKey = allowedSorts.includes(sp.sort as SortKey)
+    ? (sp.sort as SortKey)
+    : "recordedAt";
+  const dir: Dir = sp.dir === "desc" ? "desc" : "asc";
 
-  // ---- filter (quick search)
-  const q = (sp.q ?? "").trim();
-  const where =
-    q.length > 0
-      ? {
-          OR: [
-            { originalName: { contains: q, mode: "insensitive" as const } },
-            { site: { contains: q, mode: "insensitive" as const } },
-            { unitId: { contains: q, mode: "insensitive" as const } },
-          ],
-        }
-      : undefined;
+ // ---- filter (quick search)
+const q = (sp.q ?? "").trim();
+const where: Prisma.AudioFileWhereInput | undefined = q
+  ? {
+      OR: [
+        { originalName: { contains: q } },
+        { site:         { contains: q } },
+        { unitId:       { contains: q } },
+      ],
+    }
+  : undefined;
 
-  const [total, files] = await Promise.all([
-    db.audioFile.count({ where }),
-    db.audioFile.findMany({
-      where,
-      orderBy: { [sortKey]: dir },
-      skip,
-      take: size,
-      include: { _count: { select: { segments: true } } },
-    }),
-  ]);
+
+  // ---- queries (keep args plain; never pass undefined keys)
+  const total = await (where ? db.audioFile.count({ where }) : db.audioFile.count());
+
+  const orderBy: Prisma.AudioFileOrderByWithRelationInput = {
+    [sortKey]: dir,
+  } as any;
+
+  const files = await db.audioFile.findMany({
+    ...(where ? { where } : {}),
+    orderBy,
+    skip,
+    take: size,
+    include: { _count: { select: { segments: true } } },
+  });
 
   const totalPages = Math.max(1, Math.ceil(total / size));
 
@@ -73,15 +79,15 @@ export default async function Home({
 
   return (
     <main className="p-6 space-y-5">
-      <h1 className="text-2xl font-semibold">Frog Labeler</h1>
-
-      <Link
-      href="/labels"
-      className="inline-block bg-blue-600 text-white px-4 py-2 rounded hover:bg-blue-700 transition"
-    >
-      Manage Labels
-    </Link>
-
+      <div className="flex items-center justify-between">
+        <h1 className="text-2xl font-semibold">Frog Labeler</h1>
+        <Link
+          href="/labels"
+          className="inline-block bg-blue-600 text-white px-3 py-1.5 rounded hover:bg-blue-700"
+        >
+          Manage Labels
+        </Link>
+      </div>
 
       {/* Controls */}
       <form action="/" method="get" className="flex flex-wrap gap-3 items-end">
@@ -123,7 +129,6 @@ export default async function Home({
           </select>
         </label>
 
-        {/* keep page number when filtering/sorting */}
         <input type="hidden" name="page" value="1" />
         <button type="submit" className="border rounded px-3 py-1">Apply</button>
       </form>
