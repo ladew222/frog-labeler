@@ -75,6 +75,14 @@ export default async function Home({
     <main className="p-6 space-y-5">
       <h1 className="text-2xl font-semibold">Frog Labeler</h1>
 
+      <Link
+      href="/labels"
+      className="inline-block bg-blue-600 text-white px-4 py-2 rounded hover:bg-blue-700 transition"
+    >
+      Manage Labels
+    </Link>
+
+
       {/* Controls */}
       <form action="/" method="get" className="flex flex-wrap gap-3 items-end">
         <label className="text-sm">
