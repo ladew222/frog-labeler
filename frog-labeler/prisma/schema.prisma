@@ -1,0 +1,64 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = "file:./dev.db"
+}
+
+model Project {
+  id         String      @id @default(cuid())
+  name       String
+  createdAt  DateTime    @default(now())
+  audioFiles AudioFile[]
+  labels     Label[]
+}
+
+model AudioFile {
+  id           String    @id @default(cuid())
+  projectId    String
+  project      Project   @relation(fields: [projectId], references: [id])
+  originalName String    @unique
+  uri          String
+  durationS    Float?
+  sampleRate   Int?
+  recordedAt   DateTime?
+  site         String?
+  unitId       String?
+  extension    String?
+  createdAt    DateTime  @default(now())
+  segments     Segment[]
+
+  @@index([projectId])
+  @@index([recordedAt])
+}
+
+model Label {
+  id        String  @id @default(cuid())
+  projectId String
+  project   Project @relation(fields: [projectId], references: [id])
+  name      String
+  color     String?
+  hotkey    String?
+
+  // ✅ THIS LINE is the fix
+  segments Segment[]
+
+  @@unique([projectId, name])
+}
+
+model Segment {
+  id         String    @id @default(cuid())
+  audioId    String
+  audio      AudioFile @relation(fields: [audioId], references: [id])
+  startS     Float
+  endS       Float
+  labelId    String
+  label      Label     @relation(fields: [labelId], references: [id])
+  confidence Float?
+  notes      String?
+  createdAt  DateTime  @default(now())
+
+  @@index([audioId, startS])
+}
