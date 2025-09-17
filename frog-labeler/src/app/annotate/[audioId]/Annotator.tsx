@@ -127,18 +127,21 @@ const [editingId, setEditingId] = useState<string | null>(null);
 
 // working copy of fields while editing
 type Draft = {
+  labelId?: string;          // ← add this line
   individuals?: number | "";
   callingRate?: number | "";
   quality?: string;
   notes?: string;
   confidence?: number | "";
 };
+
 const [draft, setDraft] = useState<Draft>({});
 const [savingEdit, setSavingEdit] = useState(false);
 
 function startEdit(s: SegmentRow) {
   setEditingId(s.id);
   setDraft({
+    labelId: s.labelId,       // ← NEW
     individuals: s.individuals ?? "",
     callingRate: s.callingRate ?? "",
     quality: s.quality ?? "",
@@ -372,21 +375,43 @@ function cancelEdit() {
 
   useEffect(() => { if (duration > 0) syncPendingRegion(selStart, selEnd); }, [selStart, selEnd, duration]);
 
-  async function saveEdit(segmentId: string) {
+ async function saveEdit(segmentId: string) {
     setSavingEdit(true);
     try {
-      const updated = await updateSegment(segmentId, {
+      const nextLabelId = draft.labelId; // may be undefined → keep old
+      const payload: Partial<SegmentRow> = {
         individuals: toNum(draft.individuals ?? ""),
         callingRate: toNum(draft.callingRate ?? ""),
         quality: (draft.quality ?? "").trim() || null,
         notes: (draft.notes ?? "").trim() || null,
         confidence: toNum(draft.confidence ?? ""),
-      });
+        ...(nextLabelId ? { labelId: nextLabelId } : {}),   // ← allow label change
+      };
 
-      // merge back into local state (keep existing label object)
-      setSegments(prev =>
-        prev.map(s => (s.id === segmentId ? { ...s, ...updated } : s))
+      const updated = await updateSegment(segmentId, payload);
+
+      // Update local state (including label object if labelId changed)
+      setSegments((prev) =>
+        prev.map((s) => {
+          if (s.id !== segmentId) return s;
+          const newLabelId = nextLabelId ?? s.labelId;
+          const newLabelObj = labelById[newLabelId] ?? s.label;
+          return { ...s, ...updated, labelId: newLabelId, label: newLabelObj };
+        })
       );
+
+      // Also update the existing WaveSurfer region bubble color/content
+      const r = getRegionBySegmentId(segmentId);
+      if (r) {
+        const newLabelId = nextLabelId ?? segments.find((x) => x.id === segmentId)?.labelId;
+        const lbl = (newLabelId && labelById[newLabelId]) || undefined;
+        const base = lbl?.color ?? "#22c55e";
+        const col = base.startsWith("rgba") || base.startsWith("rgb") ? base : baseToRgba(base, 0.25);
+        r.update?.({
+          color: col,
+          content: chipEl(`${lbl?.name ?? newLabelId} · …${segmentId.slice(-4)}`, base),
+        });
+      }
 
       setEditingId(null);
       setDraft({});
@@ -400,6 +425,7 @@ function cancelEdit() {
       setSavingEdit(false);
     }
   }
+
 
 
   async function saveCurrentSelection(labelId: string) {
@@ -700,14 +726,27 @@ function cancelEdit() {
                     <td className="p-2 border font-mono">{s.startS.toFixed(2)}</td>
                     <td className="p-2 border font-mono">{s.endS.toFixed(2)}</td>
                     <td className="p-2 border">
-                      <span
-                        className="px-2 py-0.5 rounded"
-                        style={{ background: s.label?.color ?? "rgba(34,197,94,0.25)" }}
-                      >
-                        {s.label?.name ?? s.labelId}
-                      </span>
+                      {isEditing ? (
+                        <select
+                          className="border rounded px-2 py-1 w-full"
+                          value={draft.labelId ?? s.labelId}
+                          onChange={(e) => setDraft((d) => ({ ...d, labelId: e.target.value }))}
+                        >
+                          {labels.map((l) => (
+                            <option key={l.id} value={l.id}>
+                              {l.name}
+                            </option>
+                          ))}
+                        </select>
+                      ) : (
+                        <span
+                          className="px-2 py-0.5 rounded"
+                          style={{ background: s.label?.color ?? "rgba(34,197,94,0.25)" }}
+                        >
+                          {s.label?.name ?? s.labelId}
+                        </span>
+                      )}
                     </td>
-
                     {/* Individuals */}
                     <td className="p-2 border text-center">
                       {isEditing ? (
