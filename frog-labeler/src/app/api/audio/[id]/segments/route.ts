@@ -1,41 +1,53 @@
+// src/app/api/audio/[id]/segments/route.ts
 export const runtime = "nodejs";
 
 import { NextResponse } from "next/server";
 import { db } from "@/lib/db";
 
-type Ctx = { params: { id: string } };
+// Next.js dynamic params must be awaited in app routes
+type CtxPromise = Promise<{ params: { id: string } }>;
 
-// GET /api/audio/:id/segments
-export async function GET(_req: Request, { params }: Ctx) {
-  const segments = await db.segment.findMany({
+export async function GET(_req: Request, ctx: CtxPromise) {
+  const { params } = await ctx;
+  const segs = await db.segment.findMany({
     where: { audioId: params.id },
-    orderBy: { startS: "asc" },
     include: { label: true },
+    orderBy: { startS: "asc" },
   });
-  return NextResponse.json(segments);
+  return NextResponse.json(segs);
 }
 
-// POST /api/audio/:id/segments
-export async function POST(req: Request, { params }: Ctx) {
-  const body = await req.json().catch(() => null) as
-    | { startS?: number; endS?: number; labelId?: string }
-    | null;
+export async function POST(req: Request, ctx: CtxPromise) {
+  const { params } = await ctx;
+  const body = await req.json();
+  const {
+    startS,
+    endS,
+    labelId,
+    // optional annotation fields
+    individuals,
+    callingRate,
+    quality,
+    notes,
+    confidence,
+  } = body ?? {};
 
-  const startS = body?.startS;
-  const endS = body?.endS;
-  const labelId = body?.labelId;
-
-  if (
-    typeof startS !== "number" ||
-    typeof endS !== "number" ||
-    !labelId ||
-    !(endS > startS)
-  ) {
-    return NextResponse.json({ error: "Invalid payload" }, { status: 400 });
+  if (!(params.id && typeof startS === "number" && typeof endS === "number" && labelId)) {
+    return NextResponse.json({ error: "Missing required fields" }, { status: 400 });
   }
 
   const seg = await db.segment.create({
-    data: { audioId: params.id, startS, endS, labelId },
+    data: {
+      audioId: params.id,
+      startS,
+      endS,
+      labelId,
+      individuals: typeof individuals === "number" ? individuals : undefined,
+      callingRate: typeof callingRate === "number" ? callingRate : undefined,
+      quality: typeof quality === "string" && quality.trim() ? quality : undefined,
+      notes: typeof notes === "string" && notes.trim() ? notes : undefined,
+      confidence: typeof confidence === "number" ? confidence : undefined,
+    },
     include: { label: true },
   });
 

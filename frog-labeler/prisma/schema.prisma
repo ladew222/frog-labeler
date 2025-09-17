@@ -7,6 +7,8 @@ datasource db {
   url      = "file:./dev.db"
 }
 
+/* --- App models --- */
+
 model Project {
   id         String      @id @default(cuid())
   name       String
@@ -42,10 +44,11 @@ model Label {
   color     String?
   hotkey    String?
 
-  // ✅ THIS LINE is the fix
-  segments Segment[]
+  // relation back to segments
+  segments  Segment[]
 
   @@unique([projectId, name])
+  @@index([projectId])
 }
 
 model Segment {
@@ -58,7 +61,72 @@ model Segment {
   label      Label     @relation(fields: [labelId], references: [id])
   confidence Float?
   notes      String?
+
+  // NEW FIELDS
+  individuals Int?         // apparent number of individuals
+  callingRate Float?       // calls per second (or per minute—your choice, see below)
+  quality     String?      // optional categorical (“clear”, “noisy”, etc.)
+
   createdAt  DateTime  @default(now())
 
   @@index([audioId, startS])
+}
+
+
+/* --- NextAuth models (v4) --- */
+
+model User {
+  id            String   @id @default(cuid())
+  name          String?
+  email         String?  @unique
+  emailVerified DateTime?
+  image         String?
+
+  // default was "user" — change to "pending"
+  role          String   @default("pending")
+
+  accounts      Account[]
+  sessions      Session[]
+}
+
+
+model Account {
+  id                 String  @id @default(cuid())
+  userId             String
+  type               String
+  provider           String
+  providerAccountId  String
+
+  // SQLite: remove @db.Text; plain String maps to TEXT
+  refresh_token      String?
+  access_token       String?
+  expires_at         Int?
+  token_type         String?
+  scope              String?
+  id_token           String?
+  session_state      String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+  @@index([userId])
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime
+
+  @@unique([identifier, token])
 }

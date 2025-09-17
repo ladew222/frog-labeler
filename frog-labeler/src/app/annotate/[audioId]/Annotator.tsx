@@ -8,6 +8,14 @@ import SpectrogramPlugin from "wavesurfer.js/dist/plugins/spectrogram.esm.js";
 
 type AudioRow = { id: string; originalName: string; uri: string; recordedAt: string | null };
 type LabelRow = { id: string; name: string; hotkey: string | null; color?: string | null };
+
+
+const toNum = (v: number | "") =>
+  v === "" || Number.isNaN(Number(v)) ? undefined : Number(v);
+
+
+
+// ⬇️ include optional fields we added to the DB
 type SegmentRow = {
   id: string;
   audioId: string;
@@ -15,6 +23,11 @@ type SegmentRow = {
   endS: number;
   labelId: string;
   label: { id: string; name: string; color: string | null; hotkey: string | null };
+  individuals?: number | null;
+  callingRate?: number | null;
+  quality?: string | null;
+  notes?: string | null;
+  confidence?: number | null;
 };
 
 async function fetchAudio(id: string): Promise<AudioRow> {
@@ -39,19 +52,64 @@ export default function Annotator({ audioId }: { audioId: string }) {
   const wsRef = useRef<WaveSurfer | null>(null);
   const regionsRef = useRef<ReturnType<typeof RegionsPlugin.create> | null>(null);
 
-  const pendingId = "__pending";
 
-  const [audio, setAudio] = useState<AudioRow | null>(null);
-  const [labels, setLabels] = useState<LabelRow[]>([]);
-  const [segments, setSegments] = useState<SegmentRow[]>([]);
-  const [err, setErr] = useState<string | null>(null);
+  // ---- helpers that need access to wsRef/regionsRef ----
 
-  const [duration, setDuration] = useState<number>(0);
-  const [selStart, setSelStart] = useState<number>(0);
-  const [selEnd, setSelEnd] = useState<number>(0);
+const shortId = (id: string) => id.slice(-4);
 
-  const [saving, setSaving] = useState(false);
-  const [toast, setToast] = useState<string | null>(null);
+function getRegionBySegmentId(segId: string) {
+  const regions = regionsRef.current as any;
+  if (!regions) return null;
+  if (typeof regions.getRegion === "function") return regions.getRegion("seg_" + segId) ?? null;
+  const list = regions.getRegions?.() ?? [];
+  return list.find((r: any) => r.id === "seg_" + segId) ?? null;
+}
+
+function focusRegion(segId: string, play = false) {
+  const ws = wsRef.current;
+  const r = getRegionBySegmentId(segId);
+  if (!ws || !r) return;
+  const { start, end } = r;
+  ws.setTime(start + Math.min(0.05, Math.max(0, end - start) / 2));
+  if (play) ws.play(start, end);
+  try {
+    const el = (r as any).element as HTMLElement | undefined;
+    el?.classList.add("ring-2", "ring-amber-400");
+    setTimeout(() => el?.classList.remove("ring-2", "ring-amber-400"), 600);
+  } catch {}
+}
+
+function highlightRegion(segId: string, on: boolean) {
+  const r = getRegionBySegmentId(segId);
+  if (!r) return;
+  try {
+    const el = (r as any).element as HTMLElement | undefined;
+    if (on) el?.classList.add("ring-2", "ring-sky-400");
+    else el?.classList.remove("ring-2", "ring-sky-400");
+  } catch {}
+}
+
+
+const pendingId = "__pending";
+
+const [audio, setAudio] = useState<AudioRow | null>(null);
+const [labels, setLabels] = useState<LabelRow[]>([]);
+const [segments, setSegments] = useState<SegmentRow[]>([]);
+const [err, setErr] = useState<string | null>(null);
+
+const [duration, setDuration] = useState<number>(0);
+const [selStart, setSelStart] = useState<number>(0);
+const [selEnd, setSelEnd] = useState<number>(0);
+
+const [saving, setSaving] = useState(false);
+const [toast, setToast] = useState<string | null>(null);
+
+// ⬇️ NEW: local inputs that apply to the *next* tag you save
+const [individuals, setIndividuals] = useState<number | "">("");
+const [callingRate, setCallingRate] = useState<number | "">("");
+const [quality, setQuality] = useState<string>("");
+const [notes, setNotes] = useState<string>("");
+const [confidence, setConfidence] = useState<number | "">("");
 
   useEffect(() => {
     (async () => {
@@ -83,6 +141,7 @@ export default function Annotator({ audioId }: { audioId: string }) {
     return m;
   }, [labels]);
 
+
   // ----- WaveSurfer init -----
   useEffect(() => {
     if (!audio || !containerRef.current || !spectroRef.current) return;
@@ -97,7 +156,33 @@ export default function Annotator({ audioId }: { audioId: string }) {
     });
 
     const regions = ws.registerPlugin(RegionsPlugin.create({ dragSelection: false }));
+
+    // keep sliders in sync when user drags/resizes the pending region
+    const EPS = 1e-4;
+    const syncFromRegion = (r: any) => {
+      if (!r || String(r.id) !== pendingId) return;
+      if (Math.abs(r.start - selStart) > EPS) setSelStart(r.start);
+      if (Math.abs(r.end - selEnd) > EPS) setSelEnd(r.end);
+    };
+    regions.on("region-updated", syncFromRegion);
+    regions.on("region-update-end", syncFromRegion);
+
     regionsRef.current = regions;
+
+    // handle clicks on regions → scroll and flash table row
+    const onRegionClicked = (r: any) => {
+      const id = String(r.id || "");
+      if (!id.startsWith("seg_")) return;
+      const segId = id.slice(4);
+      const row = document.querySelector<HTMLTableRowElement>(`[data-seg-row="${segId}"]`);
+      if (row) {
+        row.scrollIntoView({ block: "center", behavior: "smooth" });
+        row.classList.add("bg-yellow-50");
+        setTimeout(() => row.classList.remove("bg-yellow-50"), 800);
+      }
+    };
+    regions.on("region-clicked", onRegionClicked);
+
 
     ws.registerPlugin(
       SpectrogramPlugin.create({
@@ -124,8 +209,9 @@ export default function Annotator({ audioId }: { audioId: string }) {
       setSelStart(start);
       setSelEnd(end);
       syncPendingRegion(start, end);
+      
 
-      // draw saved regions
+      // draw saved regions – don't rely on effect here
       for (const s of segments) {
         const base = s.label.color ?? "#22c55e";
         const col = base.startsWith("rgba") || base.startsWith("rgb") ? base : baseToRgba(base, 0.25);
@@ -134,7 +220,7 @@ export default function Annotator({ audioId }: { audioId: string }) {
           start: s.startS,
           end: s.endS,
           color: col,
-          content: chipEl(s.label.name, base),
+          content: chipEl(`${s.label.name} · …${shortId(s.id)}`, base),
           drag: false,
           resize: false,
         });
@@ -164,59 +250,62 @@ export default function Annotator({ audioId }: { audioId: string }) {
     return () => {
       window.removeEventListener("keydown", onKey);
       try {
+        // unsubscribe region listeners to avoid dupes/memory leaks
+        regions.off?.("region-updated", syncFromRegion);
+        regions.off?.("region-update-end", syncFromRegion);
+        regions.off?.("region-clicked", onRegionClicked);
+
+
+      } catch {}
+      try {
         // @ts-ignore
         const el: HTMLMediaElement | undefined = ws.getMediaElement?.();
         if (el) { el.pause(); el.src = ""; el.load(); }
         ws.unAll();
-        setTimeout(() => { try { ws.destroy(); } catch (err:any) {
-          if (err?.name !== "AbortError") console.error(err);
-        }}, 0);
+        setTimeout(() => { try { ws.destroy(); } catch {} }, 0);
       } catch {}
       wsRef.current = null;
       regionsRef.current = null;
     };
-  }, [audio, hotkeyToLabelId]);
+  }, [audio, hotkeyToLabelId]); // ← only these deps
 
   // keep a single pending region instance
   const pendingRegionRef = useRef<any>(null);
 
   // Re-render saved segments when `segments` changes
-useEffect(() => {
-  const regions = regionsRef.current;
-  const ws = wsRef.current;
-  if (!regions || !ws) return;
+  useEffect(() => {
+    const regions = regionsRef.current;
+    const ws = wsRef.current;
+    if (!regions || !ws) return;
 
-  // Remove existing saved regions (but keep the pending one)
-  regions.getRegions().forEach((r: any) => {
-    if (r.id && String(r.id).startsWith("seg_")) r.remove();
-  });
-
-  // Draw current saved segments
-  for (const s of segments) {
-    const base = s.label.color ?? "#22c55e";
-    const col = base.startsWith("rgba") || base.startsWith("rgb")
-      ? base
-      : baseToRgba(base, 0.25);
-    regions.addRegion({
-      id: "seg_" + s.id,
-      start: s.startS,
-      end: s.endS,
-      color: col,
-      content: chipEl(s.label.name, base),
-      drag: false,
-      resize: false,
+    // Remove existing saved regions (but keep the pending one)
+    regions.getRegions().forEach((r: any) => {
+      if (r.id && String(r.id).startsWith("seg_")) r.remove();
     });
-  }
 
-  // Ensure pending selection stays synced
-  if (duration > 0) syncPendingRegion(selStart, selEnd);
-}, [segments, duration]);  // only redraw on segment list or duration change
 
+
+    // Draw current saved segments
+    for (const s of segments) {
+      const base = s.label.color ?? "#22c55e";
+      const col = base.startsWith("rgba") || base.startsWith("rgb") ? base : baseToRgba(base, 0.25);
+      regions.addRegion({
+        id: "seg_" + s.id,
+        start: s.startS,
+        end: s.endS,
+        color: col,
+        content: chipEl(`${s.label.name} · …${shortId(s.id)}`, base),
+        drag: false,
+        resize: false,
+      });
+    }
+
+    if (duration > 0) syncPendingRegion(selStart, selEnd);
+  }, [segments, duration]); // only redraw on segment list or duration change
 
   function syncPendingRegion(start: number, end: number) {
     const regions = regionsRef.current;
     if (!regions) return;
-
     const minLen = 0.02;
     const s = Math.max(0, Math.min(start, end - minLen));
     const e = Math.max(s + minLen, end);
@@ -249,15 +338,22 @@ useEffect(() => {
 
     setSaving(true);
     try {
-      const res = await fetch(
-        // NOTE: backticks so `${audio.id}` interpolates
-        `/api/audio/${audio.id}/segments`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ audioId: audio.id, startS: start, endS: end, labelId }),
-        },
-      );
+      const res = await fetch(`/api/audio/${audio.id}/segments`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          audioId: audio.id,
+          startS: start,
+          endS: end,
+          labelId,
+          // ⬇️ include optional fields if provided
+          individuals: toNum(individuals),
+          callingRate: toNum(callingRate),
+          quality: quality.trim() ? quality.trim() : undefined,
+          notes: notes.trim() ? notes.trim() : undefined,
+          confidence: toNum(confidence), 
+        }),
+      });
       if (!res.ok) throw new Error(`POST /api/audio/${audio.id}/segments -> ${res.status}`);
       const saved: SegmentRow = await res.json();
 
@@ -267,7 +363,7 @@ useEffect(() => {
       regionsRef.current?.addRegion({
         id: "seg_" + saved.id,
         start, end, color: col,
-        content: chipEl(labelById[labelId]?.name ?? "label", base),
+        content: chipEl(`${labelById[labelId]?.name ?? "label"} · …${shortId(saved.id)}`, base),
         drag: false, resize: false,
       });
 
@@ -275,6 +371,13 @@ useEffect(() => {
       setSegments((prev) => [...prev, { ...saved, label: { ...labelById[labelId] } as any }]);
       setToast("Saved ✓");
       setTimeout(() => setToast(null), 1000);
+
+      // reset optional inputs after a successful save
+      setIndividuals("");
+      setCallingRate("");
+      setQuality("");
+      setNotes("");
+      setConfidence("");
     } catch (e) {
       console.error(e);
       setToast("Save failed");
@@ -383,6 +486,74 @@ useEffect(() => {
         </div>
       </div>
 
+      {/* Extra annotation fields */}
+      <div className="text-sm border rounded p-3 space-y-3">
+        <div className="font-medium">Extra annotation (optional)</div>
+        <div className="grid gap-3 md:grid-cols-5">
+          <label className="flex items-center gap-2">
+            Individuals
+            <input
+              type="number"
+              min={0}
+              className="border rounded px-2 py-1 w-24"
+              value={individuals}
+              onChange={(e) => setIndividuals(e.target.value === "" ? "" : Number(e.target.value))}
+            />
+          </label>
+
+          <label className="flex items-center gap-2">
+            Calling rate
+            <input
+              type="number"
+              min={0}
+              step="0.1"
+              className="border rounded px-2 py-1 w-28"
+              value={callingRate}
+              onChange={(e) => setCallingRate(e.target.value === "" ? "" : Number(e.target.value))}
+              title="Calls per second (or your unit)"
+            />
+          </label>
+
+          <label className="flex items-center gap-2">
+            Quality
+            <input
+              type="text"
+              className="border rounded px-2 py-1 w-32"
+              placeholder="e.g., clear / faint"
+              value={quality}
+              onChange={(e) => setQuality(e.target.value)}
+            />
+          </label>
+
+          <label className="flex items-center gap-2">
+            Confidence
+            <input
+              type="number"
+              min={0}
+              max={1}
+              step="0.01"
+              className="border rounded px-2 py-1 w-24"
+              value={confidence}
+              onChange={(e) => setConfidence(e.target.value === "" ? "" : Number(e.target.value))}
+              title="0–1"
+            />
+          </label>
+
+          <label className="md:col-span-5 flex items-start gap-2">
+            Notes
+            <textarea
+              className="border rounded px-2 py-1 w-full h-16"
+              placeholder="Free text…"
+              value={notes}
+              onChange={(e) => setNotes(e.target.value)}
+            />
+          </label>
+        </div>
+        <div className="text-xs text-slate-500">
+          These fields apply to the <em>next</em> tag you save.
+        </div>
+      </div>
+
       {/* Label buttons */}
       <div className="flex flex-wrap gap-2 items-center text-sm">
         <span className="text-slate-600 mr-2">Tag as:</span>
@@ -412,17 +583,42 @@ useEffect(() => {
           <table className="w-full text-sm border">
             <thead className="bg-slate-50">
               <tr>
+                <th className="text-left p-2 border">#</th>
+                <th className="text-left p-2 border">ID</th>
                 <th className="text-left p-2 border">Start (s)</th>
                 <th className="text-left p-2 border">End (s)</th>
                 <th className="text-left p-2 border">Label</th>
+                <th className="text-left p-2 border">Indiv.</th>
+                <th className="text-left p-2 border">Rate</th>
+                <th className="text-left p-2 border">Qual.</th>
+                <th className="text-left p-2 border">Conf.</th>
+                <th className="text-left p-2 border">Notes</th>
                 <th className="text-left p-2 border">Actions</th>
               </tr>
             </thead>
             <tbody>
               {segments
+                .slice() // don’t mutate original
                 .sort((a, b) => a.startS - b.startS)
-                .map((s) => (
-                  <tr key={s.id}>
+                .map((s, i) => (
+                  <tr
+                    key={s.id}
+                    data-seg-row={s.id}
+                    onMouseEnter={() => highlightRegion(s.id, true)}
+                    onMouseLeave={() => highlightRegion(s.id, false)}
+                  >
+                    <td className="p-2 border w-10 text-right">{i + 1}</td>
+                    <td className="p-2 border font-mono text-xs">
+                      <button
+                        type="button"
+                        className="underline"
+                        title={s.id}
+                        onClick={() => focusRegion(s.id, false)}
+                      >
+                        …{shortId(s.id)}
+                      </button>
+                    </td>
+
                     <td className="p-2 border font-mono">{s.startS.toFixed(2)}</td>
                     <td className="p-2 border font-mono">{s.endS.toFixed(2)}</td>
                     <td className="p-2 border">
@@ -430,7 +626,25 @@ useEffect(() => {
                         {s.label?.name ?? s.labelId}
                       </span>
                     </td>
-                    <td className="p-2 border">
+                    <td className="p-2 border text-center">{s.individuals ?? "—"}</td>
+                    <td className="p-2 border text-center">
+                      {s.callingRate != null ? Number(s.callingRate).toFixed(2) : "—"}
+                    </td>
+                    <td className="p-2 border">{s.quality ?? "—"}</td>
+                    <td className="p-2 border text-center">
+                      {s.confidence != null ? Number(s.confidence).toFixed(2) : "—"}
+                    </td>
+                    <td className="p-2 border max-w-[20ch] truncate" title={s.notes ?? ""}>
+                      {s.notes ?? "—"}
+                    </td>
+                    <td className="p-2 border space-x-2">
+                      <button
+                        type="button"
+                        className="border px-2 py-0.5 rounded hover:bg-slate-50"
+                        onClick={() => focusRegion(s.id, true)}
+                      >
+                        Go
+                      </button>
                       <button
                         type="button"
                         className="border px-2 py-0.5 rounded text-red-600 hover:bg-red-50"
@@ -442,6 +656,7 @@ useEffect(() => {
                   </tr>
                 ))}
             </tbody>
+
           </table>
         )}
       </div>
