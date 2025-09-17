@@ -46,6 +46,17 @@ async function fetchSegments(audioId: string): Promise<SegmentRow[]> {
   return r.json();
 }
 
+async function updateSegment(segmentId: string, data: Partial<SegmentRow>): Promise<SegmentRow> {
+  const r = await fetch(`/api/segments/${segmentId}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(data),
+  });
+  if (!r.ok) throw new Error(`PUT /api/segments/${segmentId} -> ${r.status}`);
+  return r.json();
+}
+
+
 export default function Annotator({ audioId }: { audioId: string }) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const spectroRef = useRef<HTMLDivElement | null>(null);
@@ -110,6 +121,37 @@ const [callingRate, setCallingRate] = useState<number | "">("");
 const [quality, setQuality] = useState<string>("");
 const [notes, setNotes] = useState<string>("");
 const [confidence, setConfidence] = useState<number | "">("");
+
+  // which row is being edited
+const [editingId, setEditingId] = useState<string | null>(null);
+
+// working copy of fields while editing
+type Draft = {
+  individuals?: number | "";
+  callingRate?: number | "";
+  quality?: string;
+  notes?: string;
+  confidence?: number | "";
+};
+const [draft, setDraft] = useState<Draft>({});
+const [savingEdit, setSavingEdit] = useState(false);
+
+function startEdit(s: SegmentRow) {
+  setEditingId(s.id);
+  setDraft({
+    individuals: s.individuals ?? "",
+    callingRate: s.callingRate ?? "",
+    quality: s.quality ?? "",
+    notes: s.notes ?? "",
+    confidence: s.confidence ?? "",
+  });
+}
+
+function cancelEdit() {
+  setEditingId(null);
+  setDraft({});
+}
+
 
   useEffect(() => {
     (async () => {
@@ -330,6 +372,36 @@ const [confidence, setConfidence] = useState<number | "">("");
 
   useEffect(() => { if (duration > 0) syncPendingRegion(selStart, selEnd); }, [selStart, selEnd, duration]);
 
+  async function saveEdit(segmentId: string) {
+    setSavingEdit(true);
+    try {
+      const updated = await updateSegment(segmentId, {
+        individuals: toNum(draft.individuals ?? ""),
+        callingRate: toNum(draft.callingRate ?? ""),
+        quality: (draft.quality ?? "").trim() || null,
+        notes: (draft.notes ?? "").trim() || null,
+        confidence: toNum(draft.confidence ?? ""),
+      });
+
+      // merge back into local state (keep existing label object)
+      setSegments(prev =>
+        prev.map(s => (s.id === segmentId ? { ...s, ...updated } : s))
+      );
+
+      setEditingId(null);
+      setDraft({});
+      setToast("Updated ✓");
+      setTimeout(() => setToast(null), 1000);
+    } catch (e) {
+      console.error(e);
+      setToast("Update failed");
+      setTimeout(() => setToast(null), 1200);
+    } finally {
+      setSavingEdit(false);
+    }
+  }
+
+
   async function saveCurrentSelection(labelId: string) {
     if (!audio) return;
     const start = Math.max(0, selStart);
@@ -387,6 +459,8 @@ const [confidence, setConfidence] = useState<number | "">("");
     }
   }
 
+  
+
   // delete handler INSIDE the component
   const handleDelete = useCallback(async (segmentId: string) => {
     if (!confirm("Delete this segment?")) return;
@@ -415,6 +489,8 @@ const [confidence, setConfidence] = useState<number | "">("");
 
   if (err) return <div className="p-6 text-red-600">Error: {err}</div>;
   if (!audio) return <div className="p-6">Loading…</div>;
+
+  
 
   return (
     <div className="p-6 space-y-4">
@@ -596,11 +672,13 @@ const [confidence, setConfidence] = useState<number | "">("");
                 <th className="text-left p-2 border">Actions</th>
               </tr>
             </thead>
-            <tbody>
-              {segments
-                .slice() // don’t mutate original
-                .sort((a, b) => a.startS - b.startS)
-                .map((s, i) => (
+           <tbody>
+            {segments
+              .slice()
+              .sort((a, b) => a.startS - b.startS)
+              .map((s, i) => {
+                const isEditing = editingId === s.id;
+                return (
                   <tr
                     key={s.id}
                     data-seg-row={s.id}
@@ -615,47 +693,159 @@ const [confidence, setConfidence] = useState<number | "">("");
                         title={s.id}
                         onClick={() => focusRegion(s.id, false)}
                       >
-                        …{shortId(s.id)}
+                        …{s.id.slice(-4)}
                       </button>
                     </td>
 
                     <td className="p-2 border font-mono">{s.startS.toFixed(2)}</td>
                     <td className="p-2 border font-mono">{s.endS.toFixed(2)}</td>
                     <td className="p-2 border">
-                      <span className="px-2 py-0.5 rounded" style={{ background: s.label?.color ?? "rgba(34,197,94,0.25)" }}>
+                      <span
+                        className="px-2 py-0.5 rounded"
+                        style={{ background: s.label?.color ?? "rgba(34,197,94,0.25)" }}
+                      >
                         {s.label?.name ?? s.labelId}
                       </span>
                     </td>
-                    <td className="p-2 border text-center">{s.individuals ?? "—"}</td>
+
+                    {/* Individuals */}
                     <td className="p-2 border text-center">
-                      {s.callingRate != null ? Number(s.callingRate).toFixed(2) : "—"}
+                      {isEditing ? (
+                        <input
+                          type="number"
+                          min={0}
+                          className="border rounded px-2 py-1 w-20 text-right"
+                          value={draft.individuals ?? ""}
+                          onChange={(e) =>
+                            setDraft((d) => ({ ...d, individuals: e.target.value === "" ? "" : Number(e.target.value) }))
+                          }
+                        />
+                      ) : (
+                        s.individuals ?? "—"
+                      )}
                     </td>
-                    <td className="p-2 border">{s.quality ?? "—"}</td>
+
+                    {/* Rate */}
                     <td className="p-2 border text-center">
-                      {s.confidence != null ? Number(s.confidence).toFixed(2) : "—"}
+                      {isEditing ? (
+                        <input
+                          type="number"
+                          min={0}
+                          step="0.1"
+                          className="border rounded px-2 py-1 w-24 text-right"
+                          value={draft.callingRate ?? ""}
+                          onChange={(e) =>
+                            setDraft((d) => ({ ...d, callingRate: e.target.value === "" ? "" : Number(e.target.value) }))
+                          }
+                        />
+                      ) : s.callingRate != null ? (
+                        Number(s.callingRate).toFixed(2)
+                      ) : (
+                        "—"
+                      )}
                     </td>
-                    <td className="p-2 border max-w-[20ch] truncate" title={s.notes ?? ""}>
-                      {s.notes ?? "—"}
+
+                    {/* Quality */}
+                    <td className="p-2 border">
+                      {isEditing ? (
+                        <input
+                          type="text"
+                          className="border rounded px-2 py-1 w-full"
+                          value={draft.quality ?? ""}
+                          onChange={(e) => setDraft((d) => ({ ...d, quality: e.target.value }))}
+                        />
+                      ) : (
+                        s.quality ?? "—"
+                      )}
                     </td>
-                    <td className="p-2 border space-x-2">
-                      <button
-                        type="button"
-                        className="border px-2 py-0.5 rounded hover:bg-slate-50"
-                        onClick={() => focusRegion(s.id, true)}
-                      >
-                        Go
-                      </button>
-                      <button
-                        type="button"
-                        className="border px-2 py-0.5 rounded text-red-600 hover:bg-red-50"
-                        onClick={() => handleDelete(s.id)}
-                      >
-                        Delete
-                      </button>
+
+                    {/* Confidence */}
+                    <td className="p-2 border text-center">
+                      {isEditing ? (
+                        <input
+                          type="number"
+                          min={0}
+                          max={1}
+                          step="0.01"
+                          className="border rounded px-2 py-1 w-24 text-right"
+                          value={draft.confidence ?? ""}
+                          onChange={(e) =>
+                            setDraft((d) => ({ ...d, confidence: e.target.value === "" ? "" : Number(e.target.value) }))
+                          }
+                        />
+                      ) : s.confidence != null ? (
+                        Number(s.confidence).toFixed(2)
+                      ) : (
+                        "—"
+                      )}
+                    </td>
+
+                    {/* Notes */}
+                    <td className="p-2 border max-w-[20ch]" title={s.notes ?? ""}>
+                      {isEditing ? (
+                        <input
+                          type="text"
+                          className="border rounded px-2 py-1 w-full"
+                          value={draft.notes ?? ""}
+                          onChange={(e) => setDraft((d) => ({ ...d, notes: e.target.value }))}
+                        />
+                      ) : (
+                        <span className="truncate inline-block max-w-[20ch]">{s.notes ?? "—"}</span>
+                      )}
+                    </td>
+
+                    {/* Actions */}
+                    <td className="p-2 border space-x-2 whitespace-nowrap">
+                      {isEditing ? (
+                        <>
+                          <button
+                            type="button"
+                            className="border px-2 py-0.5 rounded hover:bg-slate-50"
+                            onClick={() => saveEdit(s.id)}
+                            disabled={savingEdit}
+                          >
+                            {savingEdit ? "Saving…" : "Save"}
+                          </button>
+                          <button
+                            type="button"
+                            className="border px-2 py-0.5 rounded hover:bg-slate-50"
+                            onClick={cancelEdit}
+                            disabled={savingEdit}
+                          >
+                            Cancel
+                          </button>
+                        </>
+                      ) : (
+                        <>
+                          <button
+                            type="button"
+                            className="border px-2 py-0.5 rounded hover:bg-slate-50"
+                            onClick={() => focusRegion(s.id, true)}
+                          >
+                            Go
+                          </button>
+                          <button
+                            type="button"
+                            className="border px-2 py-0.5 rounded hover:bg-slate-50"
+                            onClick={() => startEdit(s)}
+                          >
+                            Edit
+                          </button>
+                          <button
+                            type="button"
+                            className="border px-2 py-0.5 rounded text-red-600 hover:bg-red-50"
+                            onClick={() => handleDelete(s.id)}
+                          >
+                            Delete
+                          </button>
+                        </>
+                      )}
                     </td>
                   </tr>
-                ))}
-            </tbody>
+                );
+              })}
+          </tbody>
+
 
           </table>
         )}
