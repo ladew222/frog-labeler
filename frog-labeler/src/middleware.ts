@@ -1,3 +1,4 @@
+// src/middleware.ts
 import { withAuth } from "next-auth/middleware";
 
 export default withAuth({
@@ -5,7 +6,7 @@ export default withAuth({
     authorized({ token, req }) {
       const path = req.nextUrl.pathname;
 
-      // Public paths:
+      // Public routes
       if (
         path === "/" ||
         path.startsWith("/auth") ||
@@ -13,26 +14,18 @@ export default withAuth({
       ) {
         return true;
       }
-      // Profile requires login (any role)
-      if (path.startsWith("/profile")) {
-        return !!token;
-      }
 
-      // Require login for annotate + labels
-      if (path.startsWith("/annotate")) {
-        return !!token && (token.role === "user" || token.role === "admin");
-      }
+      // Admin-only pages & APIs
+      if (path.startsWith("/labels")) return !!token && token.role === "admin";
+      if (path.startsWith("/api/admin")) return !!token && token.role === "admin";
 
-      if (path.startsWith("/labels")) {
-        return !!token && token.role === "admin";
-      }
+      // Authenticated (user or admin)
+      if (path.startsWith("/annotate")) return !!token && (token.role === "user" || token.role === "admin");
+      if (path.startsWith("/api/audio")) return !!token && (token.role === "user" || token.role === "admin");
+      if (path.startsWith("/api/segments")) return !!token && (token.role === "user" || token.role === "admin");
 
-      // APIs that should only be available to logged-in users
-      if (path.startsWith("/api/audio") || path.startsWith("/api/segments")) {
-        return !!token && (token.role === "user" || token.role === "admin");
-      }
-
-      return !!token; // default: logged-in
+      // Everything else requires login
+      return !!token;
     },
   },
 });
@@ -43,6 +36,7 @@ export const config = {
     "/labels/:path*",
     "/api/audio/:path*",
     "/api/segments/:path*",
-    // add more if needed
+    "/api/admin/:path*",   // ⬅️ add this for the ingest route
+    // add more protected paths if needed
   ],
 };
