@@ -13,6 +13,10 @@ export default withAuth({
       ) {
         return true;
       }
+      // Profile requires login (any role)
+      if (path.startsWith("/profile")) {
+        return !!token;
+      }
 
       // Require login for annotate + labels
       if (path.startsWith("/annotate")) {
