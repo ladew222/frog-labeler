@@ -1,3 +1,4 @@
+//src/app/annotate/[audioId]/Annotator.tsx
 "use client";
 
 import { useEffect, useMemo, useRef, useState, useCallback } from "react";
@@ -16,6 +17,8 @@ const toNum = (v: number | "") =>
 
 
 // ⬇️ include optional fields we added to the DB
+// in Annotator.tsx
+
 type SegmentRow = {
   id: string;
   audioId: string;
@@ -23,12 +26,19 @@ type SegmentRow = {
   endS: number;
   labelId: string;
   label: { id: string; name: string; color: string | null; hotkey: string | null };
+  // optional fields
   individuals?: number | null;
   callingRate?: number | null;
   quality?: string | null;
   notes?: string | null;
   confidence?: number | null;
+  // NEW audit fields returned by the API
+  createdAt?: string;
+  createdBy?: { id: string; name: string | null; email: string | null } | null;
+  updatedAt?: string | null;
+  updatedBy?: { id: string; name: string | null; email: string | null } | null;
 };
+
 
 async function fetchAudio(id: string): Promise<AudioRow> {
   const r = await fetch(`/api/audio/${id}`, { cache: "no-store" });
@@ -690,12 +700,14 @@ function cancelEdit() {
                 <th className="text-left p-2 border">Start (s)</th>
                 <th className="text-left p-2 border">End (s)</th>
                 <th className="text-left p-2 border">Label</th>
+                <th className="text-left p-2 border">By</th>
                 <th className="text-left p-2 border">Indiv.</th>
                 <th className="text-left p-2 border">Rate</th>
                 <th className="text-left p-2 border">Qual.</th>
                 <th className="text-left p-2 border">Conf.</th>
                 <th className="text-left p-2 border">Notes</th>
                 <th className="text-left p-2 border">Actions</th>
+                
               </tr>
             </thead>
            <tbody>
@@ -747,6 +759,10 @@ function cancelEdit() {
                         </span>
                       )}
                     </td>
+                    <td className="p-2 border">
+                      {s.updatedBy?.name || s.updatedBy?.email || s.createdBy?.name || s.createdBy?.email || "—"}
+                    </td>
+
                     {/* Individuals */}
                     <td className="p-2 border text-center">
                       {isEditing ? (

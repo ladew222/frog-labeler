@@ -1,3 +1,4 @@
+// prisma/schema.prisma
 generator client {
   provider = "prisma-client-js"
 }
@@ -62,16 +63,26 @@ model Segment {
   confidence Float?
   notes      String?
 
-  // NEW FIELDS
-  individuals Int?         // apparent number of individuals
-  callingRate Float?       // calls per second (or per minute—your choice, see below)
-  quality     String?      // optional categorical (“clear”, “noisy”, etc.)
+  // custom annotation fields
+  individuals Int?
+  callingRate Float?
+  quality     String?
 
-  createdAt  DateTime  @default(now())
+  // 🔹 audit: who created/updated this segment
+  createdById String
+  createdBy   User     @relation("SegmentCreatedBy", fields: [createdById], references: [id])
+
+  updatedById String?
+  updatedBy   User?    @relation("SegmentUpdatedBy", fields: [updatedById], references: [id])
+
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
 
   @@index([audioId, startS])
+  @@index([labelId])
+  @@index([createdById])
+  @@index([updatedById])
 }
-
 
 /* --- NextAuth models (v4) --- */
 
@@ -81,14 +92,16 @@ model User {
   email         String?  @unique
   emailVerified DateTime?
   image         String?
-
-  // default was "user" — change to "pending"
   role          String   @default("pending")
 
   accounts      Account[]
   sessions      Session[]
-}
 
+  // 🔹 back-relations for audit fields
+  createdSegments Segment[] @relation("SegmentCreatedBy")
+  updatedSegments Segment[] @relation("SegmentUpdatedBy")
+  
+}
 
 model Account {
   id                 String  @id @default(cuid())
@@ -97,7 +110,6 @@ model Account {
   provider           String
   providerAccountId  String
 
-  // SQLite: remove @db.Text; plain String maps to TEXT
   refresh_token      String?
   access_token       String?
   expires_at         Int?
