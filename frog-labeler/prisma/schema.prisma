@@ -8,31 +8,67 @@ datasource db {
   url      = "file:./dev.db"
 }
 
-/* --- App models --- */
+/**
+ * =========================
+ * Authorization / Membership
+ * =========================
+ */
+
+enum ProjectRole {
+  OWNER
+  ADMIN
+  MEMBER
+  VIEWER
+}
+
+model ProjectMembership {
+  id        String      @id @default(cuid())
+  projectId String
+  userId    String
+  role      ProjectRole @default(MEMBER)
+  createdAt DateTime    @default(now())
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  user    User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([projectId, userId]) // one membership per user per project
+  @@index([userId])
+  @@index([projectId])
+}
+
+/**
+ * =============
+ * App Models
+ * =============
+ */
 
 model Project {
-  id         String      @id @default(cuid())
-  name       String
-  createdAt  DateTime    @default(now())
-  audioFiles AudioFile[]
-  labels     Label[]
+  id          String              @id @default(cuid())
+  name        String
+  createdAt   DateTime            @default(now())
+  audioFiles  AudioFile[]
+  labels      Label[]
+  memberships ProjectMembership[] // back‑relation
 }
 
 model AudioFile {
-  id           String    @id @default(cuid())
-  projectId    String
-  project      Project   @relation(fields: [projectId], references: [id])
-  originalName String    @unique
-  uri          String
-  durationS    Float?
-  sampleRate   Int?
-  recordedAt   DateTime?
-  site         String?
-  unitId       String?
-  extension    String?
-  createdAt    DateTime  @default(now())
-  segments     Segment[]
+  id             String    @id @default(cuid())
+  projectId      String
+  project        Project   @relation(fields: [projectId], references: [id])
+  originalName   String
+  uri            String
+  durationS      Float?
+  sampleRate     Int?
+  recordedAt     DateTime?
+  site           String?
+  unitId         String?
+  extension      String?
+  sequence       Int? // optional — used if filenames include _NN
+  createdAt      DateTime  @default(now())
+  segments       Segment[]
+  lastModifiedAt DateTime  @default(now())
 
+  @@unique([projectId, originalName]) // filenames unique per project
   @@index([projectId])
   @@index([recordedAt])
 }
@@ -46,7 +82,7 @@ model Label {
   hotkey    String?
 
   // relation back to segments
-  segments  Segment[]
+  segments Segment[]
 
   @@unique([projectId, name])
   @@index([projectId])
@@ -68,15 +104,15 @@ model Segment {
   callingRate Float?
   quality     String?
 
-  // 🔹 audit: who created/updated this segment
+  // audit: who created/updated this segment
   createdById String
-  createdBy   User     @relation("SegmentCreatedBy", fields: [createdById], references: [id])
+  createdBy   User   @relation("SegmentCreatedBy", fields: [createdById], references: [id])
 
   updatedById String?
-  updatedBy   User?    @relation("SegmentUpdatedBy", fields: [updatedById], references: [id])
+  updatedBy   User?   @relation("SegmentUpdatedBy", fields: [updatedById], references: [id])
 
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 
   @@index([audioId, startS])
   @@index([labelId])
@@ -84,39 +120,45 @@ model Segment {
   @@index([updatedById])
 }
 
-/* --- NextAuth models (v4) --- */
+/**
+ * =========================
+ * NextAuth (v4) Models
+ * =========================
+ */
 
 model User {
-  id            String   @id @default(cuid())
+  id            String    @id @default(cuid())
   name          String?
-  email         String?  @unique
+  email         String?   @unique
   emailVerified DateTime?
   image         String?
-  role          String   @default("pending")
+  role          String    @default("pending") // global role if desired
 
-  accounts      Account[]
-  sessions      Session[]
+  accounts Account[]
+  sessions Session[]
 
-  // 🔹 back-relations for audit fields
+  // back-relations for audit fields
   createdSegments Segment[] @relation("SegmentCreatedBy")
   updatedSegments Segment[] @relation("SegmentUpdatedBy")
-  
+
+  // memberships
+  memberships ProjectMembership[]
 }
 
 model Account {
-  id                 String  @id @default(cuid())
-  userId             String
-  type               String
-  provider           String
-  providerAccountId  String
+  id                String @id @default(cuid())
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
 
-  refresh_token      String?
-  access_token       String?
-  expires_at         Int?
-  token_type         String?
-  scope              String?
-  id_token           String?
-  session_state      String?
+  refresh_token String?
+  access_token  String?
+  expires_at    Int?
+  token_type    String?
+  scope         String?
+  id_token      String?
+  session_state String?
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 

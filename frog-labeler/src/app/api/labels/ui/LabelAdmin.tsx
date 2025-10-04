@@ -1,38 +1,96 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
+import AddMember from "@/app/labels/ui/AddMember";
 
 type Label = {
   id: string;
   name: string;
   color: string | null;
   hotkey: string | null;
-  _count?: { segments: number }; // from API include
+  _count?: { segments: number };
 };
 
+type Project = {
+  id: string;
+  name: string;
+  role: "OWNER" | "ADMIN" | "MEMBER" | "VIEWER";
+};
+
+type IngestStats = { scanned: number; created: number; updated: number; bad: string[] } | null;
+
 export default function LabelAdmin() {
+  // ----- projects -----
+  const [projects, setProjects] = useState<Project[]>([]);
+  const [projectId, setProjectId] = useState("");
+
+  // create-first-project form
+  const [newProjectName, setNewProjectName] = useState("");
+  const [newProjectId, setNewProjectId] = useState("");
+
+  // ----- labels -----
   const [labels, setLabels] = useState<Label[]>([]);
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState<string | null>(null);
-
-  // create form
   const [form, setForm] = useState({ name: "", color: "#22c55e", hotkey: "" });
 
-  // reassign dialog state
+  // reassign dialog
   const [reassignOpen, setReassignOpen] = useState(false);
   const [reassignFrom, setReassignFrom] = useState<Label | null>(null);
-  const [reassignToId, setReassignToId] = useState<string>("");
+  const [reassignToId, setReassignToId] = useState("");
 
   const labelOptions = useMemo(
     () => labels.map(l => ({ id: l.id, name: l.name })),
     [labels]
   );
 
-  async function load() {
+  // ingest UI
+  const [busyIngest, setBusyIngest] = useState(false);
+  const [ingestErr, setIngestErr] = useState<string | null>(null);
+  const [ingestStats, setIngestStats] = useState<IngestStats>(null);
+
+
+  async function createProjectQuick() {
+  const name = (prompt("Project name (e.g., Demo)") || "").trim();
+  if (!name) return;
+    const idRaw = prompt("Optional ID (letters/numbers/dashes, e.g., demo)");
+    const id = idRaw?.trim() ? idRaw.trim() : undefined;
+
+    const res = await fetch("/api/projects", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name, id }),
+    });
+    const j = await res.json().catch(() => ({}));
+    if (!res.ok) {
+     alert(j?.error || "Failed to create project");
+    return;
+    }
+    // reload projects and select the new one
+    const p = await fetch("/api/projects").then(r => r.json());
+    setProjects(p);
+    setProjectId(j.id);
+  }
+
+  // load user projects
+  useEffect(() => {
+    (async () => {
+      const r = await fetch("/api/projects", { cache: "no-store" });
+      if (!r.ok) return; // not signed in?
+      const p: Project[] = await r.json();
+      setProjects(p);
+      if (!projectId && p.length) setProjectId(p[0].id);
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // load labels for selected project
+  async function loadLabels(pid = projectId) {
+    if (!pid) return;
     setLoading(true);
     setErr(null);
     try {
-      const r = await fetch("/api/labels", { cache: "no-store" });
+      const r = await fetch(`/api/labels?projectId=${encodeURIComponent(pid)}`, { cache: "no-store" });
       if (!r.ok) throw new Error(`GET /api/labels -> ${r.status}`);
       const data: Label[] = await r.json();
       setLabels(data);
@@ -44,12 +102,39 @@ export default function LabelAdmin() {
   }
 
   useEffect(() => {
-    void load();
-  }, []);
+    if (projectId) void loadLabels(projectId);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [projectId]);
 
+  // create first project
+  async function createProject() {
+    if (!newProjectName.trim()) return;
+    const res = await fetch("/api/projects", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        name: newProjectName.trim(),
+        id: newProjectId.trim() || undefined, // optional custom id
+      }),
+    });
+    const j = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      alert(j?.error || "Failed to create project");
+      return;
+    }
+    // reload projects and select
+    const p: Project[] = await fetch("/api/projects").then(r => r.json());
+    setProjects(p);
+    setProjectId(j.id);
+    setNewProjectName("");
+    setNewProjectId("");
+  }
+
+  // label CRUD (scoped to project)
   async function createLabel() {
-    if (!form.name.trim()) return;
+    if (!projectId || !form.name.trim()) return;
     const payload = {
+      projectId,
       name: form.name.trim(),
       color: form.color,
       hotkey: form.hotkey.trim() ? form.hotkey.trim()[0] : null,
@@ -59,35 +144,39 @@ export default function LabelAdmin() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
     });
+    const j = await r.json().catch(() => ({}));
     if (!r.ok) {
-      alert("Create failed");
+      alert(j?.error ?? "Create failed");
       return;
     }
     setForm({ name: "", color: "#22c55e", hotkey: "" });
-    await load();
+    await loadLabels();
   }
 
   async function updateLabel(id: string, patch: Partial<Label>) {
+    if (!projectId) return;
     const r = await fetch(`/api/labels/${id}`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(patch),
+      body: JSON.stringify({ projectId, ...patch }),
     });
     if (!r.ok) {
-      alert("Update failed");
+      const j = await r.json().catch(() => ({}));
+      alert(j?.error ?? "Update failed");
       return;
     }
-    await load();
+    await loadLabels();
   }
 
   async function directDelete(id: string) {
-    const r = await fetch(`/api/labels/${id}`, { method: "DELETE" });
+    if (!projectId) return;
+    const r = await fetch(`/api/labels/${id}?projectId=${encodeURIComponent(projectId)}`, { method: "DELETE" });
     if (!r.ok) {
-      const t = await r.json().catch(() => ({}));
-      alert(t?.error ?? "Delete failed");
+      const j = await r.json().catch(() => ({}));
+      alert(j?.error ?? "Delete failed");
       return;
     }
-    await load();
+    await loadLabels();
   }
 
   function onClickDelete(l: Label) {
@@ -96,36 +185,135 @@ export default function LabelAdmin() {
       if (confirm(`Delete label "${l.name}"?`)) void directDelete(l.id);
       return;
     }
-    // open reassign dialog
     setReassignFrom(l);
-    // preselect first different label if available
     const firstOther = labels.find(x => x.id !== l.id);
     setReassignToId(firstOther?.id ?? "");
     setReassignOpen(true);
   }
 
   async function confirmReassign() {
-    if (!reassignFrom || !reassignToId) return;
-    const payload = { fromId: reassignFrom.id, toId: reassignToId };
+    if (!projectId || !reassignFrom || !reassignToId) return;
+    const payload = { projectId, fromId: reassignFrom.id, toId: reassignToId };
     const r = await fetch("/api/labels/reassign", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
     });
     if (!r.ok) {
-      const t = await r.json().catch(() => ({}));
-      alert(t?.error ?? "Reassign failed");
+      const j = await r.json().catch(() => ({}));
+      alert(j?.error ?? "Reassign failed");
       return;
     }
     setReassignOpen(false);
     setReassignFrom(null);
     setReassignToId("");
-    await load();
+    await loadLabels();
+  }
+
+  // ingest
+  async function runIngest() {
+    if (!projectId) return;
+    setBusyIngest(true);
+    setIngestErr(null);
+    setIngestStats(null);
+    try {
+      const res = await fetch(`/api/admin/ingest?projectId=${encodeURIComponent(projectId)}`, { method: "POST" });
+      const j = await res.json();
+      if (!res.ok) throw new Error(j?.error || `Ingest failed (${res.status})`);
+      setIngestStats(j.stats as IngestStats);
+      await loadLabels();
+    } catch (e: any) {
+      setIngestErr(e.message || "Ingest failed");
+    } finally {
+      setBusyIngest(false);
+    }
+  }
+
+  // ----- Empty state: no projects yet -----
+  if (projects.length === 0) {
+    return (
+      <div className="space-y-3">
+        <h2 className="font-medium">Create your first project</h2>
+        <div className="flex flex-wrap gap-2">
+          <input
+            className="border rounded px-2 py-1"
+            placeholder="Project name (e.g., Demo)"
+            value={newProjectName}
+            onChange={(e) => setNewProjectName(e.target.value)}
+          />
+          <input
+            className="border rounded px-2 py-1"
+            placeholder="Optional id (e.g., demo)"
+            value={newProjectId}
+            onChange={(e) => setNewProjectId(e.target.value)}
+            title="Leave blank to auto-generate"
+          />
+          <button className="bg-emerald-600 text-white px-3 py-1.5 rounded" onClick={createProject}>
+            Create project
+          </button>
+        </div>
+      </div>
+    );
   }
 
   return (
     <div className="space-y-6">
-      {/* Create */}
+      {/* Project picker */}
+      <div className="flex items-center gap-2">
+        <span className="text-sm text-slate-600">Project:</span>
+        <select
+          className="border rounded px-2 py-1"
+          value={projectId}
+          onChange={(e) => setProjectId(e.target.value)}
+        >
+          {projects.map((p) => (
+            <option key={p.id} value={p.id}>
+              {p.name} ({p.role.toLowerCase()})
+            </option>
+          ))}
+        </select>
+
+        <button
+          type="button"
+          className="border rounded px-2 py-1 text-sm"
+          onClick={createProjectQuick}
+        >
+          New project…
+        </button>
+      </div>
+
+
+      {/* Ingest */}
+      <div className="border rounded p-3 space-y-2">
+        <div className="flex items-center gap-3">
+          <button
+            type="button"
+            onClick={runIngest}
+            disabled={busyIngest || !projectId}
+            className="bg-emerald-600 text-white px-3 py-1.5 rounded hover:bg-emerald-700 disabled:opacity-50"
+          >
+            {busyIngest ? "Scanning…" : "Scan & Ingest new audio"}
+          </button>
+          {ingestErr && <span className="text-red-600 text-sm">{ingestErr}</span>}
+        </div>
+        {ingestStats && (
+          <div className="text-sm text-slate-700">
+            <div>Scanned: <b>{ingestStats.scanned}</b></div>
+            <div>Created: <b className="text-emerald-700">{ingestStats.created}</b></div>
+            <div>Updated: <b className="text-amber-700">{ingestStats.updated}</b></div>
+            {!!ingestStats.bad?.length && (
+              <details className="mt-1">
+                <summary className="cursor-pointer">Unparsed filenames ({ingestStats.bad.length})</summary>
+                <ul className="list-disc pl-5 text-slate-600">
+                  {ingestStats.bad.map((f) => <li key={f}>{f}</li>)}
+                </ul>
+              </details>
+            )}
+          </div>
+        )}
+      </div>
+
+      {/* Create label */}
       <div className="border rounded p-4 space-y-3">
         <h2 className="font-medium">Create new label</h2>
         <div className="grid gap-3 md:grid-cols-3">
@@ -159,12 +347,12 @@ export default function LabelAdmin() {
             />
           </label>
         </div>
-        <button type="button" className="border rounded px-3 py-1" onClick={createLabel}>
+        <button type="button" className="border rounded px-3 py-1" onClick={createLabel} disabled={!projectId}>
           Add label
         </button>
       </div>
 
-      {/* List / Edit */}
+      {/* Labels table */}
       <div className="border rounded">
         <div className="p-3 border-b bg-slate-50 font-medium">Existing labels</div>
         {loading ? (
@@ -257,32 +445,26 @@ export default function LabelAdmin() {
                 <option value="" disabled>Pick a label…</option>
                 {labelOptions
                   .filter(opt => opt.id !== reassignFrom.id)
-                  .map(opt => (
-                    <option key={opt.id} value={opt.id}>{opt.name}</option>
-                  ))}
+                  .map(opt => <option key={opt.id} value={opt.id}>{opt.name}</option>)}
               </select>
             </label>
 
             <div className="flex justify-end gap-2 pt-2">
-              <button
-                type="button"
-                className="border rounded px-3 py-1"
-                onClick={() => { setReassignOpen(false); setReassignFrom(null); setReassignToId(""); }}
-              >
+              <button type="button" className="border rounded px-3 py-1"
+                onClick={() => { setReassignOpen(false); setReassignFrom(null); setReassignToId(""); }}>
                 Cancel
               </button>
-              <button
-                type="button"
-                className="border rounded px-3 py-1 bg-red-50 text-red-700 disabled:opacity-50"
-                disabled={!reassignToId}
-                onClick={() => void confirmReassign()}
-              >
+              <button type="button" className="border rounded px-3 py-1 bg-red-50 text-red-700 disabled:opacity-50"
+                disabled={!reassignToId} onClick={() => void confirmReassign()}>
                 Reassign & Delete
               </button>
             </div>
           </div>
         </div>
       )}
+
+      {/* Project members (for the selected project) */}
+      <AddMember projectId={projectId} />
     </div>
   );
 }

@@ -1,8 +1,8 @@
-// src/lib/auth.ts
 import { PrismaAdapter } from "@next-auth/prisma-adapter";
 import { db } from "@/lib/db";
 import type { NextAuthOptions } from "next-auth";
 import GitHubProvider from "next-auth/providers/github";
+import GoogleProvider from "next-auth/providers/google";
 
 export const authOptions: NextAuthOptions = {
   adapter: PrismaAdapter(db),
@@ -10,27 +10,45 @@ export const authOptions: NextAuthOptions = {
     GitHubProvider({
       clientId: process.env.GITHUB_ID!,
       clientSecret: process.env.GITHUB_SECRET!,
-      // make sure we request emails
       authorization: { params: { scope: "read:user user:email" } },
+    }),
+    GoogleProvider({
+      clientId: process.env.GOOGLE_CLIENT_ID!,
+      clientSecret: process.env.GOOGLE_CLIENT_SECRET!,
+      authorization: { params: { scope: "openid email profile" } },
     }),
   ],
   session: { strategy: "jwt" },
   pages: { signIn: "/auth/signin" },
-  debug: true, // ← log detailed NextAuth info to your server console
+  debug: true,
   callbacks: {
     async jwt({ token, user }) {
+      // On sign-in, copy role/id from the DB user
       if (user) {
-        // keep role + ensure token has the user id (sub)
+        token.sub = user.id;
         token.role = (user as any).role ?? "pending";
-        token.sub = user.id; // critical: persist id to the JWT
+        return token;
+      }
+
+      // On subsequent requests, refresh the role from DB (honors admin demotions/promotions)
+      if (token.sub) {
+        try {
+          const u = await db.user.findUnique({
+            where: { id: token.sub as string },
+            select: { role: true },
+          });
+          if (u) token.role = (u.role as any) ?? token.role ?? "pending";
+        } catch {
+          // If the DB check fails, keep whatever is already on the token
+        }
       }
       return token;
     },
+
     async session({ session, token }) {
       if (session.user) {
-        (session.user as any).role = token.role ?? "pending";
-        // critical: expose id to the client/server
         (session.user as any).id = token.sub as string;
+        (session.user as any).role = (token as any).role ?? "pending";
       }
       return session;
     },

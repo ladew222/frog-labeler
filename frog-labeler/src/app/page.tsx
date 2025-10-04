@@ -1,13 +1,23 @@
 // src/app/page.tsx
-export const runtime = "nodejs";        // Prisma needs Node runtime
-export const dynamic = "force-dynamic"; // render on each request (no ISR)
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
 export const revalidate = 0;
 
 import Link from "next/link";
+import { redirect } from "next/navigation";
+import { getServerSession } from "next-auth";
+import { authOptions } from "@/lib/auth";
 import { db } from "@/lib/db";
+import { getUserProjectIds } from "@/lib/authz";
 import type { Prisma } from "@prisma/client";
 
-type SortKey = "recordedAt" | "originalName" | "site" | "unitId";
+type SortKey =
+  | "recordedAt"
+  | "originalName"
+  | "site"
+  | "unitId"
+  | "annotations"
+  | "lastModified";
 type Dir = "asc" | "desc";
 type SP = {
   page?: string;
@@ -15,7 +25,30 @@ type SP = {
   sort?: string;
   dir?: string;
   q?: string;
+  projectId?: string;
+  site?: string;
 };
+
+function timeAgo(date: Date): string {
+  const seconds = Math.floor((Date.now() - date.getTime()) / 1000);
+  const rtf = new Intl.RelativeTimeFormat("en", { numeric: "auto" });
+  const units: [number, Intl.RelativeTimeFormatUnit][] = [
+    [60, "second"],
+    [60, "minute"],
+    [24, "hour"],
+    [7, "day"],
+    [4.345, "week"],
+    [12, "month"],
+    [Number.POSITIVE_INFINITY, "year"],
+  ];
+  let unit: Intl.RelativeTimeFormatUnit = "second";
+  let value = seconds;
+  for (const [divisor, name] of units) {
+    if (value < divisor) { unit = name; break; }
+    value = Math.floor(value / divisor);
+  }
+  return rtf.format(-value, unit);
+}
 
 export default async function Home({
   searchParams,
@@ -24,44 +57,132 @@ export default async function Home({
 }) {
   const sp = (await Promise.resolve(searchParams)) ?? {};
 
-  // ---- paging
+  // ----- auth -----
+  const session = await getServerSession(authOptions);
+  if (!session) redirect("/auth/signin");
+  const globalRole = ((session.user as any)?.role ?? "pending") as
+    | "pending"
+    | "user"
+    | "admin";
+  if (globalRole === "pending") redirect("/pending");
+  const userId = (session.user as any).id as string;
+  const isAdmin = globalRole === "admin";
+
+  // ----- visible projects (for filters + data scoping) -----
+  const visibleProjectIds = isAdmin
+    ? (await db.project.findMany({ select: { id: true } })).map((p) => p.id)
+    : await getUserProjectIds(userId);
+
+  // If a projectId filter is present, keep it only if user can see it
+  const projectIdParam = (sp.projectId ?? "").trim();
+  const projectIdFilterAllowed =
+    projectIdParam && visibleProjectIds.includes(projectIdParam)
+      ? projectIdParam
+      : "";
+
+  // ----- paging -----
   const page = Math.max(1, Number(sp.page ?? 1) || 1);
   const size = Math.min(100, Math.max(10, Number(sp.size ?? 20) || 20));
   const skip = (page - 1) * size;
 
-  // ---- sorting (whitelist)
-  const allowedSorts: SortKey[] = ["recordedAt", "originalName", "site", "unitId"];
+  // ----- sorting -----
+  const allowedSorts: SortKey[] = [
+    "recordedAt",
+    "originalName",
+    "site",
+    "unitId",
+    "annotations",
+    "lastModified",
+  ];
   const sortKey: SortKey = allowedSorts.includes(sp.sort as SortKey)
     ? (sp.sort as SortKey)
     : "recordedAt";
   const dir: Dir = sp.dir === "desc" ? "desc" : "asc";
 
- // ---- filter (quick search)
-const q = (sp.q ?? "").trim();
-const where: Prisma.AudioFileWhereInput | undefined = q
-  ? {
-      OR: [
-        { originalName: { contains: q } },
-        { site:         { contains: q } },
-        { unitId:       { contains: q } },
-      ],
-    }
-  : undefined;
+  // ----- search + filters -----
+  const q = (sp.q ?? "").trim();
+  const siteParam = (sp.site ?? "").trim();
 
+  // Base scope: only visible projects
+  const scopeFilter: Prisma.AudioFileWhereInput = visibleProjectIds.length
+    ? { projectId: { in: visibleProjectIds } }
+    : { id: { in: [] } }; // no access → nothing
 
-  // ---- queries (keep args plain; never pass undefined keys)
-  const total = await (where ? db.audioFile.count({ where }) : db.audioFile.count());
+  const projectPickFilter: Prisma.AudioFileWhereInput | undefined =
+    projectIdFilterAllowed ? { projectId: projectIdFilterAllowed } : undefined;
 
-  const orderBy: Prisma.AudioFileOrderByWithRelationInput = {
-    [sortKey]: dir,
-  } as any;
+  const qFilter: Prisma.AudioFileWhereInput | undefined = q
+    ? {
+        OR: [
+          { originalName: { contains: q } },
+          { site: { contains: q } },
+          { unitId: { contains: q } },
+        ],
+      }
+    : undefined;
 
+  const siteFilter: Prisma.AudioFileWhereInput | undefined = siteParam
+    ? { site: { equals: siteParam } }
+    : undefined;
+
+  const andFilters = [
+    scopeFilter,
+    projectPickFilter,
+    qFilter,
+    siteFilter,
+  ].filter(Boolean) as Prisma.AudioFileWhereInput[];
+  const where: Prisma.AudioFileWhereInput | undefined = andFilters.length
+    ? { AND: andFilters }
+    : undefined;
+
+  // ----- totals -----
+  const total = await (where
+    ? db.audioFile.count({ where })
+    : db.audioFile.count());
+
+  // ----- orderBy -----
+  let orderBy: Prisma.AudioFileOrderByWithRelationInput[] = [];
+  switch (sortKey) {
+    case "annotations":
+      orderBy = [{ segments: { _count: dir } }, { id: "asc" }];
+      break;
+    case "lastModified":
+      orderBy = [{ lastModifiedAt: dir }, { id: "asc" }];
+      break;
+    default:
+      orderBy = [{ [sortKey]: dir } as any, { id: "asc" }];
+  }
+
+  // ----- options for filters -----
+  const projectOptions = await db.project.findMany({
+    where: { id: { in: visibleProjectIds } },
+    select: { id: true, name: true },
+    orderBy: { name: "asc" },
+  });
+
+  // Distinct sites within the current *project scope* (or chosen project)
+  const siteRows = await db.audioFile.findMany({
+    where: projectPickFilter
+      ? (projectPickFilter as Prisma.AudioFileWhereInput)
+      : scopeFilter,
+    select: { site: true },
+    distinct: ["site"],
+    orderBy: { site: "asc" },
+  });
+  const siteOptions = siteRows
+    .map((r) => r.site)
+    .filter((s): s is string => !!s && s.trim().length > 0);
+
+  // ----- data -----
   const files = await db.audioFile.findMany({
     ...(where ? { where } : {}),
     orderBy,
     skip,
     take: size,
-    include: { _count: { select: { segments: true } } },
+    include: {
+      _count: { select: { segments: true } },
+      project: { select: { id: true, name: true } },
+    },
   });
 
   const totalPages = Math.max(1, Math.ceil(total / size));
@@ -73,6 +194,8 @@ const where: Prisma.AudioFileWhereInput | undefined = q
       sort: String(over.sort ?? sortKey),
       dir: String(over.dir ?? dir),
       q: over.q ?? q,
+      projectId: over.projectId ?? projectIdFilterAllowed,
+      site: over.site ?? siteParam,
     });
     return `/?${s.toString()}`;
   };
@@ -102,12 +225,46 @@ const where: Prisma.AudioFileWhereInput | undefined = q
         </label>
 
         <label className="text-sm">
+          <div className="text-slate-600">Project</div>
+          <select
+            name="projectId"
+            defaultValue={projectIdFilterAllowed || ""}
+            className="border rounded px-2 py-1"
+          >
+            <option value="">All projects</option>
+            {projectOptions.map((p) => (
+              <option key={p.id} value={p.id}>
+                {p.name}
+              </option>
+            ))}
+          </select>
+        </label>
+
+        <label className="text-sm">
+          <div className="text-slate-600">Site</div>
+          <select
+            name="site"
+            defaultValue={siteParam || ""}
+            className="border rounded px-2 py-1"
+          >
+            <option value="">All sites</option>
+            {siteOptions.map((s) => (
+              <option key={s} value={s}>
+                {s}
+              </option>
+            ))}
+          </select>
+        </label>
+
+        <label className="text-sm">
           <div className="text-slate-600">Sort by</div>
           <select name="sort" defaultValue={sortKey} className="border rounded px-2 py-1">
             <option value="recordedAt">Recorded time</option>
             <option value="originalName">Filename</option>
             <option value="site">Site</option>
             <option value="unitId">Unit</option>
+            <option value="annotations"># Annotations</option>
+            <option value="lastModified">Last modified</option>
           </select>
         </label>
 
@@ -130,12 +287,25 @@ const where: Prisma.AudioFileWhereInput | undefined = q
         </label>
 
         <input type="hidden" name="page" value="1" />
-        <button type="submit" className="border rounded px-3 py-1">Apply</button>
+        <button type="submit" className="border rounded px-3 py-1">
+          Apply
+        </button>
       </form>
 
       {/* Stats */}
       <div className="text-sm text-slate-600">
-        Showing <b>{files.length}</b> of <b>{total}</b> file(s).
+        Showing <b>{files.length}</b> of <b>{total}</b> file(s)
+        {projectIdFilterAllowed && (
+          <>
+            {" "}in project <b>{projectOptions.find(p => p.id === projectIdFilterAllowed)?.name ?? projectIdFilterAllowed}</b>
+          </>
+        )}
+        {siteParam && (
+          <>
+            {" "}at site <b>{siteParam}</b>
+          </>
+        )}
+        .
       </div>
 
       {/* Grid */}
@@ -147,19 +317,33 @@ const where: Prisma.AudioFileWhereInput | undefined = q
             <li key={f.id} className="border rounded p-3">
               <div className="flex items-center justify-between mb-1">
                 <div className="font-mono text-sm truncate">{f.originalName}</div>
-                <span
-                  className={`rounded-full px-2 py-0.5 text-xs font-medium ${
-                    has ? "bg-green-100 text-green-700" : "bg-slate-100 text-slate-600"
-                  }`}
-                  title={`${c} annotation${c === 1 ? "" : "s"}`}
-                >
-                  {c}
-                </span>
+                <div className="flex items-center gap-2">
+                  {isAdmin && (
+                    <span
+                      className="rounded px-2 py-0.5 text-xs bg-slate-100 text-slate-700"
+                      title={`Project ID: ${f.project?.id}`}
+                    >
+                      {f.project?.name ?? f.project?.id}
+                    </span>
+                  )}
+                  <span
+                    className={`rounded-full px-2 py-0.5 text-xs font-medium ${
+                      has ? "bg-green-100 text-green-700" : "bg-slate-100 text-slate-600"
+                    }`}
+                    title={`${c} annotation${c === 1 ? "" : "s"}`}
+                  >
+                    {c}
+                  </span>
+                </div>
               </div>
+
               <div className="text-xs text-slate-500 mb-2">
                 {f.site ?? "—"} {f.unitId ? `· ${f.unitId}` : ""}{" "}
-                {f.recordedAt ? `· ${new Date(f.recordedAt).toISOString()}` : ""}
+                {f.recordedAt ? `· ${new Date(f.recordedAt).toLocaleString("en-US")}` : ""}{" "}
+                {/* @ts-ignore lastModifiedAt exists in your schema */}
+                {f.lastModifiedAt ? `· modified ${timeAgo(new Date(f.lastModifiedAt))}` : ""}
               </div>
+
               <Link className="inline-block text-blue-600 underline" href={`/annotate/${f.id}`}>
                 Annotate
               </Link>

@@ -3,33 +3,46 @@ export const runtime = "nodejs";
 
 import { NextResponse } from "next/server";
 import { db } from "@/lib/db";
-import { getServerSession } from "next-auth";
-import { authOptions } from "@/lib/auth";
+import { getSessionOrThrow, requireProjectRole } from "@/lib/authz";
 
-// Keep this Promise-based context — it avoids the “await params” warning
-type CtxPromise = Promise<{ params: { id: string } }>;
+type ParamP = { params: Promise<{ id: string }> };
 
-export async function GET(_req: Request, ctx: CtxPromise) {
-  const { params } = await ctx;
+function bad(msg: string, code = 400) {
+  return NextResponse.json({ error: msg }, { status: code });
+}
+
+/* -------- GET (list segments) -------- */
+export async function GET(_req: Request, { params }: ParamP) {
+  const { id } = await params;
+
+  // Load audio to get its project for auth
+  const audio = await db.audioFile.findUnique({
+    where: { id },
+    select: { id: true, projectId: true },
+  });
+  if (!audio) return bad("Audio not found", 404);
+
+  const { user } = await getSessionOrThrow();
+  await requireProjectRole(user.id, audio.projectId, "VIEWER");
+
   const segs = await db.segment.findMany({
-    where: { audioId: params.id },
+    where: { audioId: id },
     include: {
-      label: true,
+      label: { select: { id: true, name: true, color: true, hotkey: true } },
       createdBy: { select: { id: true, name: true, email: true } },
       updatedBy: { select: { id: true, name: true, email: true } },
     },
     orderBy: { startS: "asc" },
   });
+
   return NextResponse.json(segs);
 }
 
-export async function POST(req: Request, ctx: CtxPromise) {
-  const { params } = await ctx;
+/* -------- POST (create segment) -------- */
+export async function POST(req: Request, { params }: ParamP) {
+  const { id } = await params;
 
-  // ✅ must be signed in to create a segment
-  const session = await getServerSession(authOptions);
-  const userId = session?.user?.id as string | undefined;
-  if (!userId) return NextResponse.json({ error: "Unauthenticated" }, { status: 401 });
+  const { user } = await getSessionOrThrow();
 
   const {
     startS,
@@ -40,40 +53,48 @@ export async function POST(req: Request, ctx: CtxPromise) {
     quality,
     notes,
     confidence,
-  } = (await req.json()) ?? {};
+  } = (await req.json().catch(() => ({}))) as Record<string, unknown>;
 
-  if (!(params.id && typeof startS === "number" && typeof endS === "number" && labelId)) {
-    return NextResponse.json({ error: "Missing required fields" }, { status: 400 });
+  if (!(id && typeof startS === "number" && typeof endS === "number" && typeof labelId === "string")) {
+    return bad("Missing required fields");
   }
 
-  // (Optional but nicer errors than P2003)
-  const [audioOk, labelOk] = await Promise.all([
-    db.audioFile.findUnique({ where: { id: params.id }, select: { id: true } }),
-    db.label.findUnique({ where: { id: labelId }, select: { id: true } }),
+  // Load audio + label and verify same project
+  const [audio, label] = await Promise.all([
+    db.audioFile.findUnique({ where: { id }, select: { id: true, projectId: true } }),
+    db.label.findUnique({ where: { id: labelId }, select: { id: true, projectId: true } }),
   ]);
-  if (!audioOk) return NextResponse.json({ error: "Audio not found" }, { status: 404 });
-  if (!labelOk) return NextResponse.json({ error: "Label not found" }, { status: 400 });
+  if (!audio) return bad("Audio not found", 404);
+  if (!label) return bad("Label not found", 404);
+  if (label.projectId !== audio.projectId) return bad("Label not in the same project", 400);
+
+  // Auth: must be able to modify this project's data
+  await requireProjectRole(user.id, audio.projectId, "MEMBER");
 
   const seg = await db.segment.create({
     data: {
-      audioId: params.id,
+      audioId: id,
       startS,
       endS,
       labelId,
-      // optional fields
-      individuals: typeof individuals === "number" ? individuals : undefined,
-      callingRate: typeof callingRate === "number" ? callingRate : undefined,
-      quality: typeof quality === "string" && quality.trim() ? quality : undefined,
-      notes: typeof notes === "string" && notes.trim() ? notes : undefined,
-      confidence: typeof confidence === "number" ? confidence : undefined,
-      // 👇 audit
-      createdById: userId,
+      individuals: typeof individuals === "number" ? (individuals as number) : undefined,
+      callingRate: typeof callingRate === "number" ? (callingRate as number) : undefined,
+      quality: typeof quality === "string" && quality.trim() ? (quality as string) : undefined,
+      notes: typeof notes === "string" && notes.trim() ? (notes as string) : undefined,
+      confidence: typeof confidence === "number" ? (confidence as number) : undefined,
+      createdById: user.id,
     },
     include: {
-      label: true,
+      label: { select: { id: true, name: true, color: true, hotkey: true } },
       createdBy: { select: { id: true, name: true, email: true } },
       updatedBy: { select: { id: true, name: true, email: true } },
     },
+  });
+
+  // bump lastModifiedAt for this audio file
+  await db.audioFile.update({
+    where: { id },
+    data: { lastModifiedAt: new Date() },
   });
 
   return NextResponse.json(seg, { status: 201 });

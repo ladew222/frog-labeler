@@ -7,7 +7,13 @@ import WaveSurfer from "wavesurfer.js";
 import RegionsPlugin from "wavesurfer.js/dist/plugins/regions.esm.js";
 import SpectrogramPlugin from "wavesurfer.js/dist/plugins/spectrogram.esm.js";
 
-type AudioRow = { id: string; originalName: string; uri: string; recordedAt: string | null };
+type AudioRow = {
+  id: string;
+  originalName: string;
+  uri: string;
+  recordedAt: string | null;
+  projectId: string; // ← new
+};
 type LabelRow = { id: string; name: string; hotkey: string | null; color?: string | null };
 
 
@@ -45,11 +51,14 @@ async function fetchAudio(id: string): Promise<AudioRow> {
   if (!r.ok) throw new Error(`GET /api/audio/${id} -> ${r.status}`);
   return r.json();
 }
-async function fetchLabels(): Promise<LabelRow[]> {
-  const r = await fetch(`/api/labels`, { cache: "no-store" });
+async function fetchLabels(projectId: string): Promise<LabelRow[]> {
+  const r = await fetch(`/api/labels?projectId=${encodeURIComponent(projectId)}`, {
+    cache: "no-store",
+  });
   if (!r.ok) throw new Error(`GET /api/labels -> ${r.status}`);
   return r.json();
 }
+
 async function fetchSegments(audioId: string): Promise<SegmentRow[]> {
   const r = await fetch(`/api/audio/${audioId}/segments`, { cache: "no-store" });
   if (!r.ok) throw new Error(`GET /api/audio/${audioId}/segments -> ${r.status}`);
@@ -165,15 +174,18 @@ function cancelEdit() {
   setDraft({});
 }
 
-
   useEffect(() => {
     (async () => {
       try {
-        const [a, ls, segs] = await Promise.all([
-          fetchAudio(audioId),
-          fetchLabels(),
+        // 1) get the audio (must include projectId from the API)
+        const a = await fetchAudio(audioId);
+
+        // 2) fetch labels scoped to that project + the segments
+        const [ls, segs] = await Promise.all([
+          fetchLabels(a.projectId),
           fetchSegments(audioId),
         ]);
+
         setAudio(a);
         setLabels(ls);
         setSegments(segs);
@@ -183,6 +195,7 @@ function cancelEdit() {
       }
     })();
   }, [audioId]);
+
 
   const labelById = useMemo(() => {
     const m: Record<string, LabelRow> = {};
