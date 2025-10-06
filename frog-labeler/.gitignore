@@ -31,7 +31,17 @@ yarn-error.log*
 .pnpm-debug.log*
 
 # env files (can opt-in for committing if needed)
-.env*
+# --- env files ---
+# Ignore locals (secrets on each machine)
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# Allow templates/defaults to be committed
+!.env.example
+# (Optional) commit a secret-free .env.production with defaults:
+!.env.production
 
 # vercel
 .vercel

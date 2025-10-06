@@ -6,22 +6,23 @@ import { getServerSession } from "next-auth";
 import { authOptions } from "@/lib/auth";
 import { requireProjectRole } from "@/lib/authz";
 
-type Ctx = { params: { id: string } };
-
 function bad(msg: string, code = 400) {
   return NextResponse.json({ error: msg }, { status: code });
 }
 
 /**
  * GET /api/audio/:id
- * Returns { id, originalName, uri, recordedAt, projectId }
+ * Returns { id, originalName, uri, recordedAt, projectId } 
  * – Auth: signed-in user must have VIEWER+ on the file's project (admins bypass).
  */
-export async function GET(_req: Request, { params }: Ctx) {
+export async function GET(
+  _req: Request,
+  ctx: { params: Promise<{ id: string }> } // 🆕 awaitable params
+) {
   const session = await getServerSession(authOptions);
   if (!session?.user?.id) return bad("Unauthenticated", 401);
 
-  const id = params?.id;
+  const { id } = await ctx.params; // ✅ await the params object
   if (!id) return bad("Missing id");
 
   const audio = await db.audioFile.findUnique({
@@ -36,7 +37,6 @@ export async function GET(_req: Request, { params }: Ctx) {
   });
   if (!audio) return bad("Not found", 404);
 
-  // Enforce project access (global admin bypass is inside requireProjectRole)
   await requireProjectRole(session.user.id, audio.projectId, "VIEWER");
 
   return NextResponse.json(audio);

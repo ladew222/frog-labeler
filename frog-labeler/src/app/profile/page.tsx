@@ -46,7 +46,11 @@ export default async function ProfilePage() {
       </section>
 
       <div className="text-sm text-slate-600">
-        (In the future, you can add settings here—e.g., preferred hotkeys, theme, or profile name edits.)
+        <div>
+        <a href="/api/auth/signout" className="text-red-600 underline">
+          Sign out
+        </a>
+      </div>
       </div>
     </main>
   );

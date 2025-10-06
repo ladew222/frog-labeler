@@ -7,6 +7,11 @@ import fs from "node:fs";
 import path from "node:path";
 import { getSessionOrThrow, requireProjectRole } from "@/lib/authz";
 
+/** Configurable paths (env) */
+const SCAN_DIR =
+  process.env.AUDIO_SCAN_DIR || path.join(process.cwd(), "public", "audio");
+const PUBLIC_PREFIX = process.env.AUDIO_PUBLIC_PREFIX || "/audio";
+
 /** Canonical: SITE[-UNIT]_YYYYMMDD_HHMMSS[_SEQ].wav (UTC) */
 function parseCanonical(name: string) {
   const base = name.replace(/^.*\//, "");
@@ -77,7 +82,9 @@ export async function POST(req: Request) {
 
     const resetQuery = url.searchParams.get("reset");
     const body = await req.json().catch(() => ({}));
-    const reset = (typeof body.reset === "boolean" ? body.reset : undefined) ?? (resetQuery === "true");
+    const reset =
+      (typeof body.reset === "boolean" ? body.reset : undefined) ??
+      (resetQuery === "true");
 
     if (!projectId) {
       return NextResponse.json({ error: "projectId is required" }, { status: 400 });
@@ -86,9 +93,8 @@ export async function POST(req: Request) {
     // Must be ADMIN (or OWNER) on the project
     await requireProjectRole(user.id, projectId, "ADMIN");
 
-    const audioDir = path.join(process.cwd(), "public", "audio");
-    if (!fs.existsSync(audioDir)) {
-      return NextResponse.json({ error: `Missing folder: ${audioDir}` }, { status: 400 });
+    if (!fs.existsSync(SCAN_DIR)) {
+      return NextResponse.json({ error: `Missing folder: ${SCAN_DIR}` }, { status: 400 });
     }
 
     if (reset) {
@@ -108,13 +114,13 @@ export async function POST(req: Request) {
       });
     }
 
-    const files = fs.readdirSync(audioDir).filter(f => f.toLowerCase().endsWith(".wav"));
+    const files = fs.readdirSync(SCAN_DIR).filter(f => f.toLowerCase().endsWith(".wav"));
     if (files.length === 0) {
       return NextResponse.json({
         ok: true,
         projectId,
         stats: { scanned: 0, created: 0, updated: 0, bad: [] },
-        note: "No .wav files found in public/audio",
+        note: `No .wav files found in ${SCAN_DIR}`,
       });
     }
 
@@ -129,7 +135,7 @@ export async function POST(req: Request) {
       const data = {
         projectId,
         originalName: fn,
-        uri: `/audio/${encodeURIComponent(fn)}`,
+        uri: `${PUBLIC_PREFIX}/${encodeURIComponent(fn)}`, // configurable public path
         recordedAt: p.recordedAt,
         site: p.site,
         unitId: p.unitId,
@@ -137,7 +143,8 @@ export async function POST(req: Request) {
         lastModifiedAt: new Date(),
       };
 
-      const key = { projectId, originalName: fn }; // @@unique([projectId, originalName])
+      // @@unique([projectId, originalName])
+      const key = { projectId, originalName: fn };
       const existing = await db.audioFile.findUnique({
         where: { projectId_originalName: key },
         select: { id: true },
