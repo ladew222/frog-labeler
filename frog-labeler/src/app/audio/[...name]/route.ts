@@ -1,50 +1,58 @@
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
+
 import { NextResponse } from "next/server";
-import { createReadStream, statSync } from "fs";
-import { join, normalize, isAbsolute } from "path";
+import { createReadStream, statSync } from "node:fs";
+import path from "node:path";
 
-const BASE_DIR =
-  process.env.AUDIO_ROOT || join(process.cwd(), "public", "audio");
+type Ctx = { params: Promise<{ name: string[] }> };
 
-// Simple, safe join: blocks path traversal
-function safeJoin(base: string, parts: string[]) {
-  const rel = normalize(parts.join("/"));
-  if (!rel || rel.startsWith("..") || isAbsolute(rel)) return null;
-  return join(base, rel);
+function jsonErr(msg: string, code = 400) {
+  return new NextResponse(JSON.stringify({ error: msg }), {
+    status: code,
+    headers: { "Content-Type": "application/json" },
+  });
 }
 
-export async function GET(
-  req: Request,
-  ctx: { params: Promise<{ name: string[] }> } // 👈 awaitable params
-) {
-  const { name } = await ctx.params;           // 👈 await it
+// Safe join that blocks traversal (.., absolute paths, etc.)
+function safeJoin(base: string, parts: string[]) {
+  const decoded = parts.map((s) => decodeURIComponent(s));
+  const joined = path.join(base, ...decoded);
+  const normBase = path.resolve(base) + path.sep;
+  const normJoined = path.resolve(joined);
+  if (!normJoined.startsWith(normBase)) return null;
+  return normJoined;
+}
 
-  if (!name?.length) {
-    return new NextResponse(JSON.stringify({ error: "Missing filename" }), {
-      status: 400,
-      headers: { "Content-Type": "application/json" },
-    });
+export async function GET(_req: Request, ctx: Ctx) {
+  const { name } = await ctx.params; // Next 15: await params
+  if (!name?.length) return jsonErr("Missing filename", 400);
+
+  // IMPORTANT: read env at request time (prevents “baked-in” /Volumes paths)
+  const BASE_DIR =
+    process.env.AUDIO_ROOT ||
+    process.env.AUDIO_DIR ||
+    path.join(process.cwd(), "public", "audio");
+
+  const filePath = safeJoin(BASE_DIR, name);
+  if (!filePath) return jsonErr("Forbidden path", 403);
+
+  let stat;
+  try {
+    stat = statSync(filePath);
+  } catch {
+    return jsonErr(`Not found: ${filePath}`, 404);
   }
 
-  const filePath = safeJoin(BASE_DIR, name);   // use awaited value
-  if (!filePath) {
-    return new NextResponse(JSON.stringify({ error: "Forbidden path" }), {
-      status: 403,
-      headers: { "Content-Type": "application/json" },
-    });
-  }
-
-  // Support simple streaming (add Range support later if needed)
-  const stat = statSync(filePath);
   const stream = createReadStream(filePath);
-
   return new NextResponse(stream as any, {
     headers: {
       "Content-Length": String(stat.size),
-      // If you may serve more than WAV, sniff by extension:
       "Content-Type": filePath.toLowerCase().endsWith(".wav")
         ? "audio/wav"
         : "application/octet-stream",
       "Accept-Ranges": "bytes",
+      "Cache-Control": "public, max-age=3600",
     },
   });
 }
