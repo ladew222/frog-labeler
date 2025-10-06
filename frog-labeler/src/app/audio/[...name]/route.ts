@@ -1,58 +1,44 @@
-export const runtime = "nodejs";
-export const dynamic = "force-dynamic";
-
 import { NextResponse } from "next/server";
-import { createReadStream, statSync } from "node:fs";
-import path from "node:path";
+import { createReadStream, statSync } from "fs";
+import { join, normalize, isAbsolute } from "path";
 
-type Ctx = { params: Promise<{ name: string[] }> };
+export const runtime = "nodejs"; // force dynamic
 
-function jsonErr(msg: string, code = 400) {
-  return new NextResponse(JSON.stringify({ error: msg }), {
-    status: code,
-    headers: { "Content-Type": "application/json" },
-  });
-}
-
-// Safe join that blocks traversal (.., absolute paths, etc.)
 function safeJoin(base: string, parts: string[]) {
-  const decoded = parts.map((s) => decodeURIComponent(s));
-  const joined = path.join(base, ...decoded);
-  const normBase = path.resolve(base) + path.sep;
-  const normJoined = path.resolve(joined);
-  if (!normJoined.startsWith(normBase)) return null;
-  return normJoined;
+  const rel = normalize(parts.join("/"));
+  if (!rel || rel.startsWith("..") || isAbsolute(rel)) return null;
+  return join(base, rel);
 }
 
-export async function GET(_req: Request, ctx: Ctx) {
-  const { name } = await ctx.params; // Next 15: await params
-  if (!name?.length) return jsonErr("Missing filename", 400);
+export async function GET(
+  req: Request,
+  ctx: { params: Promise<{ name: string[] }> } // 👈 awaitable in Next.js 15
+) {
+  const { name } = await ctx.params;
+  const BASE_DIR = process.env.AUDIO_ROOT || "public/audio";
 
-  // IMPORTANT: read env at request time (prevents “baked-in” /Volumes paths)
-  const BASE_DIR =
-    process.env.AUDIO_ROOT ||
-    process.env.AUDIO_DIR ||
-    path.join(process.cwd(), "public", "audio");
-
-  const filePath = safeJoin(BASE_DIR, name);
-  if (!filePath) return jsonErr("Forbidden path", 403);
-
-  let stat;
-  try {
-    stat = statSync(filePath);
-  } catch {
-    return jsonErr(`Not found: ${filePath}`, 404);
+  if (!name?.length) {
+    return NextResponse.json({ error: "Missing filename" }, { status: 400 });
   }
 
-  const stream = createReadStream(filePath);
-  return new NextResponse(stream as any, {
-    headers: {
-      "Content-Length": String(stat.size),
-      "Content-Type": filePath.toLowerCase().endsWith(".wav")
-        ? "audio/wav"
-        : "application/octet-stream",
-      "Accept-Ranges": "bytes",
-      "Cache-Control": "public, max-age=3600",
-    },
-  });
+  const filePath = safeJoin(BASE_DIR, name);
+  if (!filePath) {
+    return NextResponse.json({ error: "Forbidden path" }, { status: 403 });
+  }
+
+  try {
+    const stat = statSync(filePath);
+    const stream = createReadStream(filePath);
+    return new NextResponse(stream as any, {
+      headers: {
+        "Content-Length": String(stat.size),
+        "Content-Type": filePath.toLowerCase().endsWith(".wav")
+          ? "audio/wav"
+          : "application/octet-stream",
+        "Accept-Ranges": "bytes",
+      },
+    });
+  } catch (e: any) {
+    return NextResponse.json({ error: `Not found: ${filePath}` }, { status: 404 });
+  }
 }
