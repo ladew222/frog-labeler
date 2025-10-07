@@ -45,6 +45,17 @@ type SegmentRow = {
   updatedBy?: { id: string; name: string | null; email: string | null } | null;
 };
 
+async function loadPeaks(uri: string): Promise<number[] | null> {
+  // Ask the cache for peaks
+  const r = await fetch(`/api/peaks?uri=${encodeURIComponent(uri)}`, { cache: "no-store" });
+  if (r.status === 200) {
+    return r.json();            // peaks JSON
+  }
+  if (r.status === 202) {
+    return null;                // building in background
+  }
+  return null;                  // no peaks
+}
 
 async function fetchAudio(id: string): Promise<AudioRow> {
   const r = await fetch(`/api/audio/${id}`, { cache: "no-store" });
@@ -210,20 +221,35 @@ function cancelEdit() {
   }, [labels]);
 
 
-  // ----- WaveSurfer init -----
-  useEffect(() => {
-    if (!audio || !containerRef.current || !spectroRef.current) return;
+ // ----- WaveSurfer init -----
+useEffect(() => {
+  if (!audio || !containerRef.current || !spectroRef.current) return;
 
-    const ws = WaveSurfer.create({
-      container: containerRef.current,
+  let ws: WaveSurfer | null = null;
+  let cancelled = false;
+
+  (async () => {
+    // Use the same /audio/... URL your API serves (Range-enabled)
+    const uri = audio.uri; // should already look like /audio/<folder>/<...>.wav
+
+    // Try to get cached peaks
+    const peaks = await loadPeaks(uri);
+
+    ws = WaveSurfer.create({
+      container: containerRef.current!,
       height: 160,
       waveColor: "#94a3b8",
       progressColor: "#22c55e",
       cursorColor: "#0f172a",
       backend: "MediaElement",
+      partialRender: true,          // helps large files
+      minPxPerSec: 50,
+      url: uri,                     // stream with Range
+      peaks: peaks || undefined,    // instant draw if cached
     });
 
     const regions = ws.registerPlugin(RegionsPlugin.create({ dragSelection: false }));
+    regionsRef.current = regions;
 
     // keep sliders in sync when user drags/resizes the pending region
     const EPS = 1e-4;
@@ -234,8 +260,6 @@ function cancelEdit() {
     };
     regions.on("region-updated", syncFromRegion);
     regions.on("region-update-end", syncFromRegion);
-
-    regionsRef.current = regions;
 
     // handle clicks on regions → scroll and flash table row
     const onRegionClicked = (r: any) => {
@@ -251,10 +275,9 @@ function cancelEdit() {
     };
     regions.on("region-clicked", onRegionClicked);
 
-
     ws.registerPlugin(
       SpectrogramPlugin.create({
-        container: spectroRef.current,
+        container: spectroRef.current!,
         height: 220,
         labels: true,
         fftSamples: 2048,
@@ -262,7 +285,6 @@ function cancelEdit() {
     );
 
     wsRef.current = ws;
-    ws.load(audio.uri);
 
     ws.on("error", (e: any) => {
       if (e?.name === "AbortError") return;
@@ -270,16 +292,16 @@ function cancelEdit() {
     });
 
     ws.on("ready", () => {
-      const d = ws.getDuration() || 0;
+      if (cancelled) return;
+      const d = ws!.getDuration() || 0;
       setDuration(d);
       const start = 0;
       const end = Math.min(1, Math.max(0.05, d));
       setSelStart(start);
       setSelEnd(end);
       syncPendingRegion(start, end);
-      
 
-      // draw saved regions – don't rely on effect here
+      // draw saved regions
       for (const s of segments) {
         const base = s.label.color ?? "#22c55e";
         const col = base.startsWith("rgba") || base.startsWith("rgb") ? base : baseToRgba(base, 0.25);
@@ -295,47 +317,62 @@ function cancelEdit() {
       }
     });
 
+    // If peaks weren’t ready (202), poll once to attach them after a few sec
+    if (!peaks) {
+      setTimeout(async () => {
+        if (!ws || cancelled) return;
+        try {
+          const again = await loadPeaks(uri);
+          if (again && ws.setPeaks) ws.setPeaks(again);
+        } catch {}
+      }, 3000);
+    }
+
     const onKey = (e: KeyboardEvent) => {
-      if (e.code === "Space") { e.preventDefault(); ws.playPause(); return; }
+      if (e.code === "Space") { e.preventDefault(); ws!.playPause(); return; }
       if (e.key === "[") {
-        const t = ws.getCurrentTime();
+        const t = ws!.getCurrentTime();
         const end = Math.max(t + 0.05, selEnd);
         const s = Math.min(t, end - 0.01);
         setSelStart(s); setSelEnd(end); syncPendingRegion(s, end); return;
       }
       if (e.key === "]") {
-        const t = ws.getCurrentTime();
+        const t = ws!.getCurrentTime();
         const s = Math.min(t, selStart);
         const e2 = Math.max(t, s + 0.05);
         setSelStart(s); setSelEnd(e2); syncPendingRegion(s, e2); return;
       }
-      if (e.key === "l") { ws.play(selStart, selEnd); return; }
+      if (e.key === "l") { ws!.play(selStart, selEnd); return; }
       const labelId = hotkeyToLabelId[e.key];
       if (labelId) { e.preventDefault(); void saveCurrentSelection(labelId); }
     };
     window.addEventListener("keydown", onKey);
 
+    // cleanup
     return () => {
+      cancelled = true;
       window.removeEventListener("keydown", onKey);
       try {
-        // unsubscribe region listeners to avoid dupes/memory leaks
         regions.off?.("region-updated", syncFromRegion);
         regions.off?.("region-update-end", syncFromRegion);
         regions.off?.("region-clicked", onRegionClicked);
-
-
       } catch {}
       try {
         // @ts-ignore
-        const el: HTMLMediaElement | undefined = ws.getMediaElement?.();
+        const el: HTMLMediaElement | undefined = ws?.getMediaElement?.();
         if (el) { el.pause(); el.src = ""; el.load(); }
-        ws.unAll();
-        setTimeout(() => { try { ws.destroy(); } catch {} }, 0);
+        ws?.unAll();
+        setTimeout(() => { try { ws?.destroy(); } catch {} }, 0);
       } catch {}
       wsRef.current = null;
       regionsRef.current = null;
     };
-  }, [audio, hotkeyToLabelId]); // ← only these deps
+  })();
+
+  // deps: *don’t* include segments to avoid re-initializing WS
+  // segments are drawn in a separate effect (your code below)
+}, [audio, hotkeyToLabelId]);
+
 
   // keep a single pending region instance
   const pendingRegionRef = useRef<any>(null);
