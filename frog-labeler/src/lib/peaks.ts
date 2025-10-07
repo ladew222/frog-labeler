@@ -7,6 +7,9 @@ import { mapUriToDisk, relativeFromAudioRoot, getAudioRoot } from "@/lib/audioPa
 
 const exec = promisify(execFile);
 
+// Use env override if set, else use PATH
+const BIN = process.env.AUDIOWAVEFORM_BIN || "audiowaveform";
+
 // Defaults: override with env or CLI
 export const CACHE_DIR = process.env.CACHE_DIR?.trim() || "/var/cache/frog-peaks";
 export type PeakFmt = "json" | "dat";
@@ -27,6 +30,7 @@ export function outPathFor(uri: string, fmt: PeakFmt = "json"): string | null {
   mkdirSync(subDir, { recursive: true });
 
   const ext = fmt === "json" ? ".peaks.json" : ".peaks.dat";
+  // Works because `leaf` includes any subfolders from `rel`
   return join(CACHE_DIR, "peaks", `${leaf}${ext}`);
 }
 
@@ -49,12 +53,12 @@ async function runOne(
     "--pixels-per-second", String(opts.pps),
     "-b", String(opts.bits),
     "-z", "auto",
+    // NOTE: do NOT pass "--format json" on v1.10.x; the output
+    // format is inferred from the output extension (.json/.dat)
   ];
-  if (opts.fmt === "json") args.push("--format", "json");
-  // (default is .dat if you omit --format)
 
   try {
-    await exec("audiowaveform", args);
+    await exec(BIN, args);
     return "ok";
   } catch (e) {
     console.error("audiowaveform failed:", disk, e);
