@@ -48,7 +48,6 @@ async function runOne(
     "-o", out,
     "--pixels-per-second", String(opts.pps),
     "-b", String(opts.bits),
-    "--with-rms",               // nicer visuals
     "-z", "auto",
   ];
   if (opts.fmt === "json") args.push("--format", "json");
