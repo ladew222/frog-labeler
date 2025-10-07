@@ -1,16 +1,28 @@
+// src/lib/audioPath.ts
 import { join, normalize, isAbsolute } from "path";
 
-/** never allow absolute paths or .. traversal */
-export function safeJoin(base: string, segments: string[]) {
-  const rel = normalize(segments.join("/"));
-  if (!rel || rel.startsWith("..") || isAbsolute(rel)) return null;
-  return join(base, rel);
+const DEFAULT_AUDIO_ROOT = "/mnt/frogshare/Data";
+
+/** Returns the on-disk base folder for audio files. */
+export function getAudioRoot(): string {
+  return process.env.AUDIO_ROOT?.trim() || DEFAULT_AUDIO_ROOT;
 }
 
-/** Map a URI like /audio/FOLDER/A/B.wav -> disk path under AUDIO_ROOT */
-export function mapUriToDisk(uri: string) {
-  const base = process.env.AUDIO_ROOT || join(process.cwd(), "public", "audio");
-  if (!uri.startsWith("/audio/")) return null;
-  const rest = uri.slice("/audio/".length).split("/");
-  return safeJoin(base, rest);
+/** Map a URI like `/audio/Folder/2015/File.wav` → `/mnt/.../Folder/2015/File.wav`. */
+export function mapUriToDisk(uri: string): string | null {
+  if (!uri?.startsWith("/audio/")) return null;
+  const rel = decodeURIComponent(uri.slice("/audio/".length));
+  const safe = normalize(rel);
+  if (!safe || safe.startsWith("..") || isAbsolute(safe)) return null;
+  return join(getAudioRoot(), safe);
+}
+
+/** The path segment after `/audio/`, decoded. e.g. `Folder/2015/File.wav`. */
+export function relativeFromAudioRoot(uri: string): string | null {
+  if (!uri?.startsWith("/audio/")) return null;
+  try {
+    return decodeURIComponent(uri.slice("/audio/".length));
+  } catch {
+    return uri.slice("/audio/".length);
+  }
 }

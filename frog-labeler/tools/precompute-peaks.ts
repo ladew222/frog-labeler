@@ -1,70 +1,54 @@
 // tools/precompute-peaks.ts
-/* eslint-disable no-console */
-import { readdirSync, statSync } from "fs";
-import { join } from "path";
+import "dotenv/config";
 import { db } from "@/lib/db";
-import { AUDIO_ROOT, mapUriToDisk } from "@/lib/audioPath";
-import { processMany } from "@/lib/peaks";
+import { processMany, CACHE_DIR, type PeakOptions } from "@/lib/peaks";
 
-type Mode = "db" | "walk";
+type Flags = {
+  db: boolean;
+  concurrency: number;
+  pps: number;
+  bits: 8 | 16;
+  fmt: "json" | "dat";
+};
 
-function parseArgs() {
-  const a = process.argv.slice(2);
-  const out: any = { mode: "db" as Mode, concurrency: 2, fmt: "json", pps: 50, bits: 8, root: AUDIO_ROOT };
-  for (let i = 0; i < a.length; i++) {
-    const k = a[i];
-    const v = a[i + 1];
-    if (k === "--walk") { out.mode = "walk"; }
-    else if (k === "--db") { out.mode = "db"; }
-    else if (k === "--root") { out.root = v; i++; }
-    else if (k === "--concurrency") { out.concurrency = Number(v); i++; }
-    else if (k === "--fmt") { out.fmt = v; i++; }
-    else if (k === "--pps") { out.pps = Number(v); i++; }
-    else if (k === "--bits") { out.bits = Number(v); i++; }
-  }
-  return out;
-}
-
-function walkWavs(root: string): { uri: string; diskPath: string }[] {
-  const out: { uri: string; diskPath: string }[] = [];
-  const rec = (dir: string, rel = "") => {
-    for (const name of readdirSync(dir)) {
-      const abs = join(dir, name);
-      const st = statSync(abs);
-      const relPath = rel ? `${rel}/${name}` : name;
-      if (st.isDirectory()) rec(abs, relPath);
-      else if (/\.wav$/i.test(name)) {
-        out.push({ uri: `/audio/${relPath}`, diskPath: abs });
-      }
-    }
+function parseFlags(): Flags {
+  const argv = process.argv.slice(2);
+  const f: Flags = {
+    db: argv.includes("--db"),
+    concurrency: Number(argv[argv.indexOf("--concurrency") + 1] || 4) as number,
+    pps: Number(argv[argv.indexOf("--pps") + 1] || 50),
+    bits: Number(argv[argv.indexOf("--bits") + 1] || 8) as 8 | 16,
+    fmt: (argv[argv.indexOf("--fmt") + 1] || "json") as "json" | "dat",
   };
-  rec(root);
-  return out;
+  return f;
 }
 
 (async () => {
-  const args = parseArgs();
-  let targets: { uri: string; diskPath: string }[] = [];
+  const flags = parseFlags();
 
-  if (args.mode === "db") {
+  let uris: string[] = [];
+  if (flags.db) {
     const rows = await db.audioFile.findMany({ select: { uri: true } });
-    targets = rows
-      .filter(r => r.uri?.startsWith("/audio/"))
-      .map(r => ({ uri: r.uri!, diskPath: mapUriToDisk(r.uri!) }))
-      .filter(t => !!t.diskPath) as any[];
+    uris = rows.map((r) => r.uri).filter((u): u is string => !!u && u.startsWith("/audio/"));
   } else {
-    targets = walkWavs(args.root);
+    console.error("No inputs provided. Use --db or add your own source of URIs.");
+    process.exit(1);
   }
 
-  console.log(`Targets: ${targets.length} file(s), mode=${args.mode}, root=${args.root}`);
+  console.log(
+    `Targets: ${uris.length} file(s), mode=${flags.db ? "db" : "custom"}, cacheDir=${CACHE_DIR}`
+  );
 
-  const res = await processMany(targets, {
-    concurrency: args.concurrency,
-    fmt: args.fmt,
-    pixelsPerSecond: args.pps,
-    bits: args.bits,
-  });
+  const res = await processMany(uris, {
+    concurrency: flags.concurrency,
+    pps: flags.pps,
+    bits: flags.bits,
+    fmt: flags.fmt,
+  } as PeakOptions);
 
   console.log("Done:", res);
-  process.exit(res.fail > 0 ? 1 : 0);
-})();
+  process.exit(0);
+})().catch((e) => {
+  console.error(e);
+  process.exit(1);
+});

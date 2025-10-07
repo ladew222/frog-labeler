@@ -1,89 +1,86 @@
 // src/lib/peaks.ts
-import { promisify } from "util";
 import { execFile } from "child_process";
-import { dirname, join } from "path";
-import { mkdirSync, existsSync, writeFileSync } from "fs";
-import { relativeFromAudioRoot } from "./audioPath";
+import { promisify } from "util";
+import { mkdirSync, existsSync } from "fs";
+import { join, dirname } from "path";
+import { mapUriToDisk, relativeFromAudioRoot, getAudioRoot } from "@/lib/audioPath";
 
 const exec = promisify(execFile);
 
-export type PeaksOpts = {
-  cacheDir?: string;            // base cache dir (default /var/cache/frog-peaks)
-  fmt?: "json" | "dat";         // output format
-  pixelsPerSecond?: number;     // audiowaveform --pixels-per-second
-  bits?: 8 | 16;                // audiowaveform -b
-  fft?: number;                 // optional --fft-size
-  concurrency?: number;         // parallel workers
-  silenceErrors?: boolean;      // if true, don't throw on single-file failures
+// Defaults: override with env or CLI
+export const CACHE_DIR = process.env.CACHE_DIR?.trim() || "/var/cache/frog-peaks";
+export type PeakFmt = "json" | "dat";
+
+export type PeakOptions = {
+  concurrency: number;
+  pps: number;     // pixels per second
+  bits: 8 | 16;
+  fmt: PeakFmt;
 };
 
-const DEFAULTS: Required<PeaksOpts> = {
-  cacheDir: process.env.CACHE_DIR || "/var/cache/frog-peaks",
-  fmt: "json",
-  pixelsPerSecond: 50,
-  bits: 8,
-  fft: 0,
-  concurrency: 2,
-  silenceErrors: true,
-};
-
-export type PeaksTarget = {
-  uri: string;       // DB URI, e.g. /audio/INDU08/2015/foo.wav
-  diskPath: string;  // resolved absolute file path
-};
-
-/** Compute destination path inside cache, mirroring the audio folder structure */
-export function outPathFor(uri: string, opts: PeaksOpts = {}): string | null {
+export function outPathFor(uri: string, fmt: PeakFmt = "json"): string | null {
   const rel = relativeFromAudioRoot(uri);
   if (!rel) return null;
-  const { cacheDir, fmt } = { ...DEFAULTS, ...opts };
-  const base = join(cacheDir, "peaks", rel); // …/peaks/INDU08/.../file.wav
-  return base.replace(/\.wav$/i, `.peaks.${fmt}`);
+
+  const leaf = rel.replace(/\.wav$/i, "");
+  const subDir = join(CACHE_DIR, "peaks", dirname(rel));
+  mkdirSync(subDir, { recursive: true });
+
+  const ext = fmt === "json" ? ".peaks.json" : ".peaks.dat";
+  return join(CACHE_DIR, "peaks", `${leaf}${ext}`);
 }
 
-/** Process one file if missing; return output path or null if skipped/failed */
-export async function processOne(t: PeaksTarget, opts: PeaksOpts = {}): Promise<string | null> {
-  const cfg = { ...DEFAULTS, ...opts };
-  const out = outPathFor(t.uri, cfg);
-  if (!out) return null;
+async function runOne(
+  uri: string,
+  opts: PeakOptions
+): Promise<"ok" | "skip" | "fail"> {
+  if (!uri?.startsWith("/audio/")) return "skip";
 
-  if (existsSync(out)) return out;
+  const disk = mapUriToDisk(uri);
+  if (!disk) return "skip";
 
-  mkdirSync(dirname(out), { recursive: true });
+  const out = outPathFor(uri, opts.fmt);
+  if (!out) return "skip";
+  if (existsSync(out)) return "skip";
 
-  const args = ["-i", t.diskPath, "-o", out, "--pixels-per-second", String(cfg.pixelsPerSecond), "-b", String(cfg.bits), "-z", "auto"];
-  if (cfg.fmt === "dat") args.push("--format", "dat");
-  if (cfg.fft && cfg.fft > 0) args.push("--fft-size", String(cfg.fft));
+  const args = [
+    "-i", disk,
+    "-o", out,
+    "--pixels-per-second", String(opts.pps),
+    "-b", String(opts.bits),
+    "--with-rms",               // nicer visuals
+    "-z", "auto",
+  ];
+  if (opts.fmt === "json") args.push("--format", "json");
+  // (default is .dat if you omit --format)
 
   try {
-    await exec("audiowaveform", args, { maxBuffer: 1024 * 1024 * 32 });
-    return out;
-  } catch (e: any) {
-    // write an error sentinel near the output for visibility
-    try { writeFileSync(out + ".error.txt", String(e?.stderr || e?.message || e)); } catch {}
-    if (!cfg.silenceErrors) throw e;
-    return null;
+    await exec("audiowaveform", args);
+    return "ok";
+  } catch (e) {
+    console.error("audiowaveform failed:", disk, e);
+    return "fail";
   }
 }
 
-/** Run with a worker pool */
-export async function processMany(list: PeaksTarget[], opts: PeaksOpts = {}): Promise<{ ok: number; fail: number; skipped: number; }> {
-  const cfg = { ...DEFAULTS, ...opts };
-  const q = list.slice();
+export async function processMany(
+  uris: string[],
+  opts: PeakOptions
+): Promise<{ ok: number; fail: number; skipped: number; root: string }> {
+  const root = getAudioRoot();
+  const q = [...uris];
   let ok = 0, fail = 0, skipped = 0;
 
-  const worker = async () => {
+  const workers = Array.from({ length: Math.max(1, opts.concurrency) }, async () => {
     while (q.length) {
-      const t = q.shift()!;
-      const out = outPathFor(t.uri, cfg);
-      if (!out) { skipped++; continue; }
-      if (existsSync(out)) { skipped++; continue; }
-      const res = await processOne(t, cfg);
-      if (res) ok++; else fail++;
+      const uri = q.shift()!;
+      const r = await runOne(uri, opts);
+      if (r === "ok") ok++;
+      else if (r === "fail") fail++;
+      else skipped++;
     }
-  };
+  });
 
-  const workers = Array.from({ length: Math.max(1, cfg.concurrency) }, worker);
   await Promise.all(workers);
-  return { ok, fail, skipped };
+  return { ok, fail, skipped, root };
 }
