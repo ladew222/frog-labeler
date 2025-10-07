@@ -30,7 +30,6 @@ export function outPathFor(uri: string, fmt: PeakFmt = "json"): string | null {
   mkdirSync(subDir, { recursive: true });
 
   const ext = fmt === "json" ? ".peaks.json" : ".peaks.dat";
-  // Works because `leaf` includes any subfolders from `rel`
   return join(CACHE_DIR, "peaks", `${leaf}${ext}`);
 }
 
@@ -47,15 +46,20 @@ async function runOne(
   if (!out) return "skip";
   if (existsSync(out)) return "skip";
 
-  const args = [
-    "-i", disk,
-    "-o", out,
-    "--pixels-per-second", String(opts.pps),
-    "-b", String(opts.bits),
-    "-z", "auto",
-    // NOTE: do NOT pass "--format json" on v1.10.x; the output
-    // format is inferred from the output extension (.json/.dat)
-  ];
+  const args = ["-i", disk, "-o", out];
+
+  // v1.10.x: you must NOT pass both --pixels-per-second and -z
+  if (opts.pps && opts.pps > 0) {
+    args.push("--pixels-per-second", String(opts.pps));
+  } else {
+    // Only use zoom if PPS not specified
+    args.push("-z", "auto");
+  }
+
+  args.push("-b", String(opts.bits));
+
+  // NOTE: Do NOT pass "--format json" on v1.10.x; output format is inferred
+  // from output extension (.json or .dat)
 
   try {
     await exec(BIN, args);
