@@ -19,7 +19,7 @@ export default async function RootLayout({ children }: { children: React.ReactNo
 
   return (
     <html lang="en">
-      <body>
+      <body className="flex flex-col min-h-screen">
         {/* pass the server session down so client hooks are instant */}
         <SessionProvider session={session}>
           {/* Top toolbar */}
@@ -52,7 +52,21 @@ export default async function RootLayout({ children }: { children: React.ReactNo
             </div>
           </header>
 
-          <div className="px-4">{children}</div>
+          {/* Main content */}
+          <main className="flex-grow px-4">{children}</main>
+
+          {/* Footer */}
+          <footer className="mt-10 pt-6 border-t text-sm text-slate-600 flex flex-col md:flex-row items-center justify-between gap-3 px-6 pb-6">
+            <div>
+              Created in cooperation with{" "}
+              <span className="font-semibold">Viterbo Computer Science</span>
+            </div>
+            <img
+              src="viterbo_horiz_rgb.jpg"
+              alt="Viterbo University logo"
+              className="h-10 w-auto"
+            />
+          </footer>
         </SessionProvider>
       </body>
     </html>

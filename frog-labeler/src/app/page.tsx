@@ -11,6 +11,8 @@ import { db } from "@/lib/db";
 import { getUserProjectIds } from "@/lib/authz";
 import type { Prisma } from "@prisma/client";
 
+/* ----------------------------- types & helpers ----------------------------- */
+
 type SortKey =
   | "recordedAt"
   | "originalName"
@@ -27,6 +29,7 @@ type SP = {
   q?: string;
   projectId?: string;
   site?: string;
+  folder?: string; // NEW
 };
 
 function timeAgo(date: Date): string {
@@ -50,6 +53,20 @@ function timeAgo(date: Date): string {
   return rtf.format(-value, unit);
 }
 
+// Pull the first segment after `/audio/` and decode it.
+function firstFolderFromUri(uri: string): string | null {
+  if (!uri.startsWith("/audio/")) return null;
+  const rest = uri.slice("/audio/".length);
+  const seg = rest.split("/")[0] || "";
+  try {
+    return decodeURIComponent(seg);
+  } catch {
+    return seg || null;
+  }
+}
+
+/* --------------------------------- page ----------------------------------- */
+
 export default async function Home({
   searchParams,
 }: {
@@ -60,25 +77,20 @@ export default async function Home({
   // ----- auth -----
   const session = await getServerSession(authOptions);
   if (!session) redirect("/auth/signin");
-  const globalRole = ((session.user as any)?.role ?? "pending") as
-    | "pending"
-    | "user"
-    | "admin";
+  const globalRole = ((session.user as any)?.role ?? "pending") as "pending" | "user" | "admin";
   if (globalRole === "pending") redirect("/pending");
   const userId = (session.user as any).id as string;
   const isAdmin = globalRole === "admin";
 
-  // ----- visible projects (for filters + data scoping) -----
+  // ----- visible projects -----
   const visibleProjectIds = isAdmin
     ? (await db.project.findMany({ select: { id: true } })).map((p) => p.id)
     : await getUserProjectIds(userId);
 
-  // If a projectId filter is present, keep it only if user can see it
+  // Project filter (only if user can see it)
   const projectIdParam = (sp.projectId ?? "").trim();
   const projectIdFilterAllowed =
-    projectIdParam && visibleProjectIds.includes(projectIdParam)
-      ? projectIdParam
-      : "";
+    projectIdParam && visibleProjectIds.includes(projectIdParam) ? projectIdParam : "";
 
   // ----- paging -----
   const page = Math.max(1, Number(sp.page ?? 1) || 1);
@@ -102,11 +114,11 @@ export default async function Home({
   // ----- search + filters -----
   const q = (sp.q ?? "").trim();
   const siteParam = (sp.site ?? "").trim();
+  const folderParam = (sp.folder ?? "").trim(); // NEW
 
-  // Base scope: only visible projects
   const scopeFilter: Prisma.AudioFileWhereInput = visibleProjectIds.length
     ? { projectId: { in: visibleProjectIds } }
-    : { id: { in: [] } }; // no access → nothing
+    : { id: { in: [] } };
 
   const projectPickFilter: Prisma.AudioFileWhereInput | undefined =
     projectIdFilterAllowed ? { projectId: projectIdFilterAllowed } : undefined;
@@ -121,24 +133,28 @@ export default async function Home({
       }
     : undefined;
 
-  const siteFilter: Prisma.AudioFileWhereInput | undefined = siteParam
-    ? { site: { equals: siteParam } }
-    : undefined;
+  const siteFilter: Prisma.AudioFileWhereInput | undefined =
+    siteParam ? { site: { equals: siteParam } } : undefined;
 
-  const andFilters = [
-    scopeFilter,
-    projectPickFilter,
-    qFilter,
-    siteFilter,
-  ].filter(Boolean) as Prisma.AudioFileWhereInput[];
+  // Folder filter is implemented as uri startsWith(`/audio/<encoded folder>/`)
+  const folderFilter: Prisma.AudioFileWhereInput | undefined =
+    folderParam
+      ? {
+          uri: {
+            startsWith: `/audio/${encodeURIComponent(folderParam)}/`,
+          },
+        }
+      : undefined;
+
+  const andFilters = [scopeFilter, projectPickFilter, qFilter, siteFilter, folderFilter].filter(
+    Boolean,
+  ) as Prisma.AudioFileWhereInput[];
   const where: Prisma.AudioFileWhereInput | undefined = andFilters.length
     ? { AND: andFilters }
     : undefined;
 
   // ----- totals -----
-  const total = await (where
-    ? db.audioFile.count({ where })
-    : db.audioFile.count());
+  const total = await (where ? db.audioFile.count({ where }) : db.audioFile.count());
 
   // ----- orderBy -----
   let orderBy: Prisma.AudioFileOrderByWithRelationInput[] = [];
@@ -147,9 +163,11 @@ export default async function Home({
       orderBy = [{ segments: { _count: dir } }, { id: "asc" }];
       break;
     case "lastModified":
+      // @ts-ignore your schema likely has this
       orderBy = [{ lastModifiedAt: dir }, { id: "asc" }];
       break;
     default:
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       orderBy = [{ [sortKey]: dir } as any, { id: "asc" }];
   }
 
@@ -160,11 +178,8 @@ export default async function Home({
     orderBy: { name: "asc" },
   });
 
-  // Distinct sites within the current *project scope* (or chosen project)
   const siteRows = await db.audioFile.findMany({
-    where: projectPickFilter
-      ? (projectPickFilter as Prisma.AudioFileWhereInput)
-      : scopeFilter,
+    where: projectPickFilter ? (projectPickFilter as Prisma.AudioFileWhereInput) : scopeFilter,
     select: { site: true },
     distinct: ["site"],
     orderBy: { site: "asc" },
@@ -172,6 +187,18 @@ export default async function Home({
   const siteOptions = siteRows
     .map((r) => r.site)
     .filter((s): s is string => !!s && s.trim().length > 0);
+
+  // Build folder options from URIs within current *project scope*
+  const uriRows = await db.audioFile.findMany({
+    where: projectPickFilter ? (projectPickFilter as Prisma.AudioFileWhereInput) : scopeFilter,
+    select: { uri: true },
+  });
+  const folderSet = new Set<string>();
+  for (const r of uriRows) {
+    const f = firstFolderFromUri(r.uri);
+    if (f) folderSet.add(f);
+  }
+  const folderOptions = Array.from(folderSet).sort((a, b) => a.localeCompare(b));
 
   // ----- data -----
   const files = await db.audioFile.findMany({
@@ -196,9 +223,12 @@ export default async function Home({
       q: over.q ?? q,
       projectId: over.projectId ?? projectIdFilterAllowed,
       site: over.site ?? siteParam,
+      folder: over.folder ?? folderParam,
     });
     return `/?${s.toString()}`;
   };
+
+  /* --------------------------------- UI ----------------------------------- */
 
   return (
     <main className="p-6 space-y-5">
@@ -235,6 +265,22 @@ export default async function Home({
             {projectOptions.map((p) => (
               <option key={p.id} value={p.id}>
                 {p.name}
+              </option>
+            ))}
+          </select>
+        </label>
+
+        <label className="text-sm">
+          <div className="text-slate-600">Folder</div>
+          <select
+            name="folder"
+            defaultValue={folderParam || ""}
+            className="border rounded px-2 py-1"
+          >
+            <option value="">All folders</option>
+            {folderOptions.map((f) => (
+              <option key={f} value={f}>
+                {f}
               </option>
             ))}
           </select>
@@ -296,23 +342,17 @@ export default async function Home({
       <div className="text-sm text-slate-600">
         Showing <b>{files.length}</b> of <b>{total}</b> file(s)
         {projectIdFilterAllowed && (
-          <>
-            {" "}in project <b>{projectOptions.find(p => p.id === projectIdFilterAllowed)?.name ?? projectIdFilterAllowed}</b>
-          </>
+          <> in project <b>{projectOptions.find(p => p.id === projectIdFilterAllowed)?.name ?? projectIdFilterAllowed}</b></>
         )}
-        {siteParam && (
-          <>
-            {" "}at site <b>{siteParam}</b>
-          </>
-        )}
-        .
+        {folderParam && <> in folder <b>{folderParam}</b></>}
+        {siteParam && <> at site <b>{siteParam}</b></>}.
       </div>
 
       {/* Grid */}
       <ul className="grid gap-3 md:grid-cols-2">
         {files.map((f) => {
           const c = f._count.segments;
-          const has = c > 0;
+          const folder = firstFolderFromUri(f.uri) ?? "—";
           return (
             <li key={f.id} className="border rounded p-3">
               <div className="flex items-center justify-between mb-1">
@@ -328,7 +368,7 @@ export default async function Home({
                   )}
                   <span
                     className={`rounded-full px-2 py-0.5 text-xs font-medium ${
-                      has ? "bg-green-100 text-green-700" : "bg-slate-100 text-slate-600"
+                      c > 0 ? "bg-green-100 text-green-700" : "bg-slate-100 text-slate-600"
                     }`}
                     title={`${c} annotation${c === 1 ? "" : "s"}`}
                   >
@@ -338,6 +378,7 @@ export default async function Home({
               </div>
 
               <div className="text-xs text-slate-500 mb-2">
+                <span className="mr-1">📁 {folder}</span>
                 {f.site ?? "—"} {f.unitId ? `· ${f.unitId}` : ""}{" "}
                 {f.recordedAt ? `· ${new Date(f.recordedAt).toLocaleString("en-US")}` : ""}{" "}
                 {/* @ts-ignore lastModifiedAt exists in your schema */}
