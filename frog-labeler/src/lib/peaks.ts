@@ -16,7 +16,7 @@ export type PeakFmt = "json" | "dat";
 
 export type PeakOptions = {
   concurrency: number;
-  pps: number;     // pixels per second
+  pps: number; // pixels per second
   bits: 8 | 16;
   fmt: PeakFmt;
 };
@@ -76,7 +76,9 @@ export async function processMany(
 ): Promise<{ ok: number; fail: number; skipped: number; root: string }> {
   const root = getAudioRoot();
   const q = [...uris];
-  let ok = 0, fail = 0, skipped = 0;
+  let ok = 0,
+    fail = 0,
+    skipped = 0;
 
   const workers = Array.from({ length: Math.max(1, opts.concurrency) }, async () => {
     while (q.length) {
