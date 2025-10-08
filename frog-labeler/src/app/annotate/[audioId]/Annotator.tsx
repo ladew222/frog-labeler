@@ -275,14 +275,21 @@ useEffect(() => {
     };
     regions.on("region-clicked", onRegionClicked);
 
-    ws.registerPlugin(
-      SpectrogramPlugin.create({
-        container: spectroRef.current!,
-        height: 220,
-        labels: true,
-        fftSamples: 2048,
-      }),
-    );
+    // Lighter spectrogram (faster to render)
+    const t0 = performance.now();
+    const spectro = SpectrogramPlugin.create({
+      container: spectroRef.current!,
+      height: 160,     // was 220
+      labels: false,   // hide frequency labels
+      fftSamples: 1024, // was 2048; fewer bins = faster
+      pixelRatio: 1,   // avoid extra work on HiDPI
+      // frequencyMax: 8000, // optional: cap top freq for more speed
+    });
+    spectro.once?.("ready", () => {
+      console.log("spectrogram ready in", Math.round(performance.now() - t0), "ms");
+    });
+    ws.registerPlugin(spectro);
+
 
     wsRef.current = ws;
 
