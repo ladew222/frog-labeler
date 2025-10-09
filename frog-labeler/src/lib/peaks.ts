@@ -4,6 +4,7 @@ import { promisify } from "util";
 import { mkdirSync, existsSync } from "fs";
 import { join, dirname } from "path";
 import { mapUriToDisk, relativeFromAudioRoot, getAudioRoot } from "@/lib/audioPath";
+import { readFileSync, writeFileSync } from "fs";
 
 const exec = promisify(execFile);
 
@@ -16,7 +17,7 @@ export type PeakFmt = "json" | "dat";
 
 export type PeakOptions = {
   concurrency: number;
-  pps: number; // pixels per second
+  pps: number;     // pixels per second
   bits: 8 | 16;
   fmt: PeakFmt;
 };
@@ -63,6 +64,14 @@ async function runOne(
 
   try {
     await exec(BIN, args);
+    // if we produced JSON peaks, also write stats next to it
+    if (opts.fmt === "json") {
+      const json = JSON.parse(readFileSync(out, "utf8"));
+      const peaks: number[] = Array.isArray(json?.data) ? json.data : [];
+      const stats = computePeakStats(peaks);
+      writeFileSync(statsPathFromOut(out), JSON.stringify(stats));
+    }
+  return "ok";
     return "ok";
   } catch (e) {
     console.error("audiowaveform failed:", disk, e);
@@ -76,9 +85,7 @@ export async function processMany(
 ): Promise<{ ok: number; fail: number; skipped: number; root: string }> {
   const root = getAudioRoot();
   const q = [...uris];
-  let ok = 0,
-    fail = 0,
-    skipped = 0;
+  let ok = 0, fail = 0, skipped = 0;
 
   const workers = Array.from({ length: Math.max(1, opts.concurrency) }, async () => {
     while (q.length) {
@@ -92,4 +99,26 @@ export async function processMany(
 
   await Promise.all(workers);
   return { ok, fail, skipped, root };
+}
+
+
+// --- simple stats from 8-bit peaks (0..255) ---
+function computePeakStats(peaks: number[]) {
+  const n = peaks.length || 1;
+  let sum = 0, max = 0, active = 0;
+  const THRESH = 6; // tiny noise floor
+
+  for (const v of peaks) { sum += v; if (v > max) max = v; if (v > THRESH) active++; }
+
+  const mean = sum / n;
+  const activity_pct = (active / n) * 100;
+  const sorted = peaks.slice().sort((a, b) => a - b);
+  const p95 = sorted[Math.floor(0.95 * (n - 1))] ?? 0;
+  const likely_sound = activity_pct > 2 && p95 > 12;
+
+  return { version: 1, count: n, mean, max, p95, activity_pct, likely_sound };
+}
+
+function statsPathFromOut(outPath: string) {
+  return outPath.replace(/\.peaks\.json$/i, ".stats.json");
 }

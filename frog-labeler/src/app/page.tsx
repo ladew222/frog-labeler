@@ -10,6 +10,11 @@ import { authOptions } from "@/lib/auth";
 import { db } from "@/lib/db";
 import { getUserProjectIds } from "@/lib/authz";
 import type { Prisma } from "@prisma/client";
+import { readActivityStatsForUri, type PeakStats } from "@/lib/peakStats";
+
+
+
+
 
 /* ----------------------------- types & helpers ----------------------------- */
 
@@ -64,6 +69,37 @@ function firstFolderFromUri(uri: string): string | null {
     return seg || null;
   }
 }
+
+function ActivityBadge({ s }: { s: PeakStats | null }) {
+  if (!s)
+    return (
+      <span className="text-xs px-2 py-0.5 rounded bg-slate-100 text-slate-500">
+        no stats
+      </span>
+    );
+
+  const pct = s.activity_pct ?? 0;
+  if (pct < 0.5) {
+    return (
+      <span className="text-xs px-2 py-0.5 rounded bg-slate-100 text-slate-600">
+        Silent
+      </span>
+    );
+  }
+  if (s.likely_sound) {
+    return (
+      <span className="text-xs px-2 py-0.5 rounded bg-green-100 text-green-700">
+        Likely sound · {pct.toFixed(1)}%
+      </span>
+    );
+  }
+  return (
+    <span className="text-xs px-2 py-0.5 rounded bg-sky-100 text-sky-700">
+      Activity · {pct.toFixed(1)}%
+    </span>
+  );
+}
+
 
 /* --------------------------------- page ----------------------------------- */
 
@@ -201,16 +237,24 @@ export default async function Home({
   const folderOptions = Array.from(folderSet).sort((a, b) => a.localeCompare(b));
 
   // ----- data -----
-  const files = await db.audioFile.findMany({
-    ...(where ? { where } : {}),
-    orderBy,
-    skip,
-    take: size,
-    include: {
-      _count: { select: { segments: true } },
-      project: { select: { id: true, name: true } },
-    },
-  });
+// ----- data -----
+const filesRaw = await db.audioFile.findMany({
+  ...(where ? { where } : {}),
+  orderBy,
+  skip,
+  take: size,
+  include: {
+    _count: { select: { segments: true } },
+    project: { select: { id: true, name: true } },
+  },
+});
+
+// Attach precomputed stats server-side (no client fetch)
+const files = filesRaw.map((f) => {
+  const stats = readActivityStatsForUri(f.uri);
+  return { ...f, __stats: stats as PeakStats | null };
+});
+
 
   const totalPages = Math.max(1, Math.ceil(total / size));
 
@@ -366,6 +410,10 @@ export default async function Home({
                       {f.project?.name ?? f.project?.id}
                     </span>
                   )}
+
+                  {/* 👇 new badge */}
+                  <ActivityBadge s={f.__stats ?? null} />
+
                   <span
                     className={`rounded-full px-2 py-0.5 text-xs font-medium ${
                       c > 0 ? "bg-green-100 text-green-700" : "bg-slate-100 text-slate-600"
@@ -375,7 +423,9 @@ export default async function Home({
                     {c}
                   </span>
                 </div>
+
               </div>
+
 
               <div className="text-xs text-slate-500 mb-2">
                 <span className="mr-1">📁 {folder}</span>
