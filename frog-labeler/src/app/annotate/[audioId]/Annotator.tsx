@@ -45,17 +45,28 @@ type SegmentRow = {
   updatedBy?: { id: string; name: string | null; email: string | null } | null;
 };
 
-async function loadPeaks(uri: string): Promise<number[] | null> {
-  // Ask the cache for peaks
+async function loadPeaks(uri: string): Promise<number[] | number[][] | null> {
   const r = await fetch(`/api/peaks?uri=${encodeURIComponent(uri)}`, { cache: "no-store" });
+
   if (r.status === 200) {
-    return r.json();            // peaks JSON
+    const json = await r.json();
+    const raw = Array.isArray(json) ? json : json.data;
+    if (!raw) return null;
+
+    // Normalize 8-bit 0–255 → -1..1
+    const normalize = (x: number) => (x - 128) / 128;
+
+    if (Array.isArray(raw[0])) {
+      return (raw as number[][]).map(ch => ch.map(normalize));
+    } else {
+      return (raw as number[]).map(normalize);
+    }
   }
-  if (r.status === 202) {
-    return null;                // building in background
-  }
-  return null;                  // no peaks
+
+  if (r.status === 202) return null; // still building
+  return null;
 }
+
 
 async function fetchAudio(id: string): Promise<AudioRow> {
   const r = await fetch(`/api/audio/${id}`, { cache: "no-store" });
