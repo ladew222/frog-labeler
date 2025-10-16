@@ -35,6 +35,8 @@ type SP = {
   projectId?: string;
   site?: string;
   folder?: string; // NEW
+  from?: string;   // ← NEW (YYYY-MM-DD)
+  to?: string;     // ← NEW (YYYY-MM-DD)
 };
 
 function timeAgo(date: Date): string {
@@ -57,6 +59,20 @@ function timeAgo(date: Date): string {
   }
   return rtf.format(-value, unit);
 }
+
+function parseISODate(d?: string): Date | null {
+  if (!d) return null;
+  // Only accept YYYY-MM-DD
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(d)) return null;
+  const dt = new Date(d + "T00:00:00Z");
+  return Number.isNaN(dt.getTime()) ? null : dt;
+}
+function endOfDayUTC(d: Date): Date {
+  // exclusive upper bound: next day at 00:00Z
+  const nd = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() + 1));
+  return nd;
+}
+
 
 // Pull the first segment after `/audio/` and decode it.
 function firstFolderFromUri(uri: string): string | null {
@@ -152,6 +168,12 @@ export default async function Home({
   const siteParam = (sp.site ?? "").trim();
   const folderParam = (sp.folder ?? "").trim(); // NEW
 
+  const fromParam = (sp.from ?? "").trim();
+  const toParam   = (sp.to ?? "").trim();
+  const fromDate = parseISODate(fromParam);
+  const toDate   = parseISODate(toParam);
+
+
   const scopeFilter: Prisma.AudioFileWhereInput = visibleProjectIds.length
     ? { projectId: { in: visibleProjectIds } }
     : { id: { in: [] } };
@@ -182,15 +204,33 @@ export default async function Home({
         }
       : undefined;
 
-  const andFilters = [scopeFilter, projectPickFilter, qFilter, siteFilter, folderFilter].filter(
-    Boolean,
-  ) as Prisma.AudioFileWhereInput[];
+    // ----- filters -----
+  const dateFilter: Prisma.AudioFileWhereInput | undefined =
+    fromDate || toDate
+      ? {
+          recordedAt: {
+            ...(fromDate ? { gte: fromDate } : {}),
+            ...(toDate ? { lt: endOfDayUTC(toDate) } : {}), // exclusive upper bound
+          },
+        }
+      : undefined;
+
+  const andFilters = [
+    scopeFilter,
+    projectPickFilter,
+    qFilter,
+    siteFilter,
+    folderFilter,
+    dateFilter, // ← new filter
+  ].filter(Boolean) as Prisma.AudioFileWhereInput[];
+
   const where: Prisma.AudioFileWhereInput | undefined = andFilters.length
     ? { AND: andFilters }
     : undefined;
 
   // ----- totals -----
   const total = await (where ? db.audioFile.count({ where }) : db.audioFile.count());
+
 
   // ----- orderBy -----
   let orderBy: Prisma.AudioFileOrderByWithRelationInput[] = [];
@@ -268,9 +308,12 @@ const files = filesRaw.map((f) => {
       projectId: over.projectId ?? projectIdFilterAllowed,
       site: over.site ?? siteParam,
       folder: over.folder ?? folderParam,
+      from: over.from ?? fromParam,   // NEW
+      to: over.to ?? toParam,         // NEW
     });
     return `/?${s.toString()}`;
   };
+
 
   /* --------------------------------- UI ----------------------------------- */
 
@@ -313,7 +356,25 @@ const files = filesRaw.map((f) => {
             ))}
           </select>
         </label>
+        <label className="text-sm">
+          <div className="text-slate-600">From (UTC)</div>
+          <input
+            type="date"
+            name="from"
+            defaultValue={fromParam || ""}
+            className="border rounded px-2 py-1"
+          />
+        </label>
 
+        <label className="text-sm">
+          <div className="text-slate-600">To (UTC)</div>
+          <input
+            type="date"
+            name="to"
+            defaultValue={toParam || ""}
+            className="border rounded px-2 py-1"
+          />
+        </label>
         <label className="text-sm">
           <div className="text-slate-600">Folder</div>
           <select

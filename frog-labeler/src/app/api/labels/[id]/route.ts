@@ -5,10 +5,15 @@ import { NextResponse } from "next/server";
 import { db } from "@/lib/db";
 import { getSessionOrThrow, requireProjectRole } from "@/lib/authz";
 
-export async function PATCH(req: Request, { params }: { params: { id: string } }) {
+type Params = { id: string };
+
+export async function PATCH(
+  req: Request,
+  ctx: { params: Promise<Params> }   // ← params is a Promise now
+) {
   try {
     const { user } = await getSessionOrThrow();
-    const { id } = params;
+    const { id } = await ctx.params;  // ← await it
 
     const body = await req.json().catch(() => ({}));
     const { name, color, hotkey, projectId: projectIdFromClient } = body ?? {};
@@ -28,16 +33,15 @@ export async function PATCH(req: Request, { params }: { params: { id: string } }
       return NextResponse.json({ error: "projectId mismatch" }, { status: 400 });
     }
 
-    const data: Record<string, any> = {};
+    const data: Record<string, unknown> = {};
     if (name !== undefined) {
       const n = String(name).trim();
       if (!n) return NextResponse.json({ error: "Name cannot be empty" }, { status: 400 });
       data.name = n;
     }
     if (color !== undefined) data.color = color ?? null;
-    if (hotkey !== undefined) {
-      data.hotkey = hotkey === null ? null : String(hotkey).slice(0, 1);
-    }
+    if (hotkey !== undefined) data.hotkey = hotkey === null ? null : String(hotkey).slice(0, 1);
+
     if (Object.keys(data).length === 0) {
       return NextResponse.json({ error: "No changes supplied" }, { status: 400 });
     }
@@ -53,10 +57,13 @@ export async function PATCH(req: Request, { params }: { params: { id: string } }
   }
 }
 
-export async function DELETE(_req: Request, { params }: { params: { id: string } }) {
+export async function DELETE(
+  _req: Request,
+  ctx: { params: Promise<Params> }    // ← params as Promise
+) {
   try {
     const { user } = await getSessionOrThrow();
-    const { id } = params;
+    const { id } = await ctx.params;  // ← await it
 
     // Find label & usage
     const label = await db.label.findUnique({
