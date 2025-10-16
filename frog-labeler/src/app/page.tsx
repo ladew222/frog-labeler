@@ -37,6 +37,8 @@ type SP = {
   folder?: string; // NEW
   from?: string;   // ← NEW (YYYY-MM-DD)
   to?: string;     // ← NEW (YYYY-MM-DD)
+  mdFrom?: string;   // e.g. "03-01"
+  mdTo?: string;     // e.g. "05-31"
 };
 
 function timeAgo(date: Date): string {
@@ -59,6 +61,32 @@ function timeAgo(date: Date): string {
   }
   return rtf.format(-value, unit);
 }
+
+function Chip({
+  label,
+  value,
+  href,
+}: { label: string; value: string; href?: string }) {
+  return (
+    <span className="inline-flex items-center gap-1 text-xs px-2 py-0.5 rounded-full bg-slate-100 text-slate-700 border">
+      <span className="font-medium">{label}:</span> <span className="font-mono">{value}</span>
+      {href ? (
+        <Link href={href} className="ml-1 text-slate-500 hover:text-slate-800" title="Clear">✕</Link>
+      ) : null}
+    </span>
+  );
+}
+
+
+function parseMd(v?: string) {
+  const s = (v ?? "").trim();
+  const m = /^(\d{2})-(\d{2})$/.exec(s);
+  if (!m) return null;
+  const mm = Number(m[1]), dd = Number(m[2]);
+  if (mm < 1 || mm > 12 || dd < 1 || dd > 31) return null;
+  return { m: mm, d: dd };
+}
+
 
 function parseISODate(d?: string): Date | null {
   if (!d) return null;
@@ -87,14 +115,18 @@ function firstFolderFromUri(uri: string): string | null {
 }
 
 function ActivityBadge({ s }: { s: PeakStats | null }) {
-  if (!s)
+  if (!s) {
     return (
       <span className="text-xs px-2 py-0.5 rounded bg-slate-100 text-slate-500">
         no stats
       </span>
     );
+  }
 
-  const pct = s.activity_pct ?? 0;
+  const pct = (s.activeRatio ?? 0) * 100;
+  // crude “likely sound” heuristic; tweak as you like
+  const likely = (s.p95 ?? 0) >= 3 || (s.score ?? 0) >= 35;
+
   if (pct < 0.5) {
     return (
       <span className="text-xs px-2 py-0.5 rounded bg-slate-100 text-slate-600">
@@ -102,7 +134,7 @@ function ActivityBadge({ s }: { s: PeakStats | null }) {
       </span>
     );
   }
-  if (s.likely_sound) {
+  if (likely) {
     return (
       <span className="text-xs px-2 py-0.5 rounded bg-green-100 text-green-700">
         Likely sound · {pct.toFixed(1)}%
@@ -115,6 +147,7 @@ function ActivityBadge({ s }: { s: PeakStats | null }) {
     </span>
   );
 }
+
 
 
 /* --------------------------------- page ----------------------------------- */
@@ -165,13 +198,17 @@ export default async function Home({
 
   // ----- search + filters -----
   const q = (sp.q ?? "").trim();
-  const siteParam = (sp.site ?? "").trim();
-  const folderParam = (sp.folder ?? "").trim(); // NEW
+  const siteParam   = (sp.site ?? "").trim();
+  const folderParam = (sp.folder ?? "").trim();
 
-  const fromParam = (sp.from ?? "").trim();
-  const toParam   = (sp.to ?? "").trim();
-  const fromDate = parseISODate(fromParam);
-  const toDate   = parseISODate(toParam);
+  // date inputs
+  const fromParam   = (sp.from ?? "").trim();   // YYYY-MM-DD
+  const toParam     = (sp.to   ?? "").trim();   // YYYY-MM-DD
+  const mdFromParam = (sp.mdFrom ?? "").trim(); // MM-DD (seasonal)
+  const mdToParam   = (sp.mdTo   ?? "").trim(); // MM-DD (seasonal)
+  const hasAbsDates = !!(fromParam || toParam);
+  const hasSeason   = !!(mdFromParam || mdToParam);
+  const dateModeConflict = hasAbsDates && hasSeason;
 
 
   const scopeFilter: Prisma.AudioFileWhereInput = visibleProjectIds.length
@@ -185,8 +222,8 @@ export default async function Home({
     ? {
         OR: [
           { originalName: { contains: q } },
-          { site: { contains: q } },
-          { unitId: { contains: q } },
+          { site:        { contains: q } },
+          { unitId:      { contains: q } },
         ],
       }
     : undefined;
@@ -194,39 +231,79 @@ export default async function Home({
   const siteFilter: Prisma.AudioFileWhereInput | undefined =
     siteParam ? { site: { equals: siteParam } } : undefined;
 
-  // Folder filter is implemented as uri startsWith(`/audio/<encoded folder>/`)
   const folderFilter: Prisma.AudioFileWhereInput | undefined =
     folderParam
-      ? {
-          uri: {
-            startsWith: `/audio/${encodeURIComponent(folderParam)}/`,
-          },
-        }
+      ? { uri: { startsWith: `/audio/${encodeURIComponent(folderParam)}/` } }
       : undefined;
 
-    // ----- filters -----
-  const dateFilter: Prisma.AudioFileWhereInput | undefined =
-    fromDate || toDate
-      ? {
-          recordedAt: {
-            ...(fromDate ? { gte: fromDate } : {}),
-            ...(toDate ? { lt: endOfDayUTC(toDate) } : {}), // exclusive upper bound
-          },
-        }
-      : undefined;
+  // Base where WITHOUT any date restriction (to discover min/max year in scope)
+  const baseWhere: Prisma.AudioFileWhereInput | undefined = (() => {
+    const parts = [scopeFilter, projectPickFilter, qFilter, siteFilter, folderFilter]
+      .filter(Boolean) as Prisma.AudioFileWhereInput[];
+    return parts.length ? { AND: parts } : undefined;
+  })();
 
+  // Find min/max recordedAt in the current scope (single roundtrip)
+  const mm = await db.audioFile.aggregate({
+    where: baseWhere,
+    _min: { recordedAt: true },
+    _max: { recordedAt: true },
+  });
+  const minYear = mm._min.recordedAt ? mm._min.recordedAt.getUTCFullYear() : 2000;
+  const maxYear = mm._max.recordedAt ? mm._max.recordedAt.getUTCFullYear() : minYear;
+
+  // Build date condition
+  const fromDate = parseISODate(fromParam);
+  const toDate   = parseISODate(toParam);
+
+  let dateWhere: Prisma.AudioFileWhereInput | undefined;
+
+  if (fromDate || toDate) {
+    // Absolute date wins if present
+    dateWhere = {
+      recordedAt: {
+        ...(fromDate ? { gte: fromDate } : {}),
+        ...(toDate   ? { lt: endOfDayUTC(toDate) } : {}), // exclusive upper bound
+      },
+    };
+  } else {
+    // Seasonal window across all years in scope
+    const a = parseMd(mdFromParam);
+    const b = parseMd(mdToParam);
+    if (a && b) {
+      const ranges: Prisma.AudioFileWhereInput[] = [];
+      for (let y = minYear; y <= maxYear; y++) {
+        const start = new Date(Date.UTC(y, a.m - 1, a.d, 0, 0, 0));
+        const end   = new Date(Date.UTC(y, b.m - 1, b.d, 23, 59, 59));
+        if (end >= start) {
+          // same-year span
+          ranges.push({ recordedAt: { gte: start, lte: end } });
+        } else {
+          // wraps new year (e.g., 11-15 → 02-20)
+          const end1   = new Date(Date.UTC(y, 11, 31, 23, 59, 59));
+          const start2 = new Date(Date.UTC(y, 0, 1, 0, 0, 0));
+          const end2   = new Date(Date.UTC(y, b.m - 1, b.d, 23, 59, 59));
+          ranges.push({ recordedAt: { gte: start, lte: end1 } });
+          ranges.push({ recordedAt: { gte: start2, lte: end2 } });
+        }
+      }
+      if (ranges.length) dateWhere = { OR: ranges };
+    }
+  }
+
+  // Final WHERE
   const andFilters = [
     scopeFilter,
     projectPickFilter,
     qFilter,
     siteFilter,
     folderFilter,
-    dateFilter, // ← new filter
+    dateWhere,
   ].filter(Boolean) as Prisma.AudioFileWhereInput[];
 
-  const where: Prisma.AudioFileWhereInput | undefined = andFilters.length
-    ? { AND: andFilters }
-    : undefined;
+const where: Prisma.AudioFileWhereInput | undefined =
+  andFilters.length ? { AND: andFilters } : undefined;
+
 
   // ----- totals -----
   const total = await (where ? db.audioFile.count({ where }) : db.audioFile.count());
@@ -300,19 +377,22 @@ const files = filesRaw.map((f) => {
 
   const href = (over: Partial<SP>) => {
     const s = new URLSearchParams({
-      page: String(over.page ?? page),
-      size: String(over.size ?? size),
-      sort: String(over.sort ?? sortKey),
-      dir: String(over.dir ?? dir),
-      q: over.q ?? q,
+      page:  String(over.page ?? page),
+      size:  String(over.size ?? size),
+      sort:  String(over.sort ?? sortKey),
+      dir:   String(over.dir  ?? dir),
+      q:       over.q       ?? q,
       projectId: over.projectId ?? projectIdFilterAllowed,
-      site: over.site ?? siteParam,
-      folder: over.folder ?? folderParam,
-      from: over.from ?? fromParam,   // NEW
-      to: over.to ?? toParam,         // NEW
+      site:      over.site      ?? siteParam,
+      folder:    over.folder    ?? folderParam,
+      from:   over.from   ?? fromParam,
+      to:     over.to     ?? toParam,
+      mdFrom: over.mdFrom ?? mdFromParam,
+      mdTo:   over.mdTo   ?? mdToParam,
     });
     return `/?${s.toString()}`;
   };
+
 
 
   /* --------------------------------- UI ----------------------------------- */
@@ -330,14 +410,78 @@ const files = filesRaw.map((f) => {
       </div>
 
       {/* Controls */}
-      <form action="/" method="get" className="flex flex-wrap gap-3 items-end">
+    <form action="/" method="get" className="flex flex-wrap items-end gap-3">
+      {/* Row 1: Date filters */}
+{/* DATE – single row, no internal wrap */}
+<div className="inline-flex flex-nowrap items-end gap-2 border rounded px-2 py-1 text-xs whitespace-nowrap shrink-0">
+  <span className="text-slate-700 mr-1">Date</span>
+
+  <label className="flex flex-col">
+    <span className="text-slate-600">From (UTC)</span>
+    <input
+      type="date"
+      name="from"
+      defaultValue={fromParam || ""}
+      className="border rounded px-2 h-8 w-32"
+      disabled={hasSeason}
+    />
+  </label>
+
+  <label className="flex flex-col">
+    <span className="text-slate-600">To (UTC)</span>
+    <input
+      type="date"
+      name="to"
+      defaultValue={toParam || ""}
+      className="border rounded px-2 h-8 w-32"
+      disabled={hasSeason}
+    />
+  </label>
+
+  <label className="flex flex-col">
+    <span className="text-slate-600">From (MM-DD)</span>
+    <input
+      name="mdFrom"
+      defaultValue={mdFromParam}
+      placeholder="MM-DD"
+      className="border rounded px-2 h-8 w-20"
+      pattern="\d{2}-\d{2}"
+      disabled={hasAbsDates}
+    />
+  </label>
+
+  <label className="flex flex-col">
+    <span className="text-slate-600">To (MM-DD)</span>
+    <input
+      name="mdTo"
+      defaultValue={mdToParam}
+      placeholder="MM-DD"
+      className="border rounded px-2 h-8 w-20"
+      pattern="\d{2}-\d{2}"
+      disabled={hasAbsDates}
+    />
+  </label>
+
+  <Link
+    href={href({ from: "", to: "", mdFrom: "", mdTo: "" })}
+    className="border rounded px-2 h-8 inline-flex items-center hover:bg-slate-100"
+    title="Clear all date filters"
+  >
+    Clear
+  </Link>
+</div>
+
+
+
+      {/* Row 2: the rest of the compact controls */}
+      <div className="flex flex-wrap gap-3 items-end">
         <label className="text-sm">
           <div className="text-slate-600">Search</div>
           <input
             name="q"
             defaultValue={q}
             placeholder="name, site, unit..."
-            className="border rounded px-2 py-1"
+            className="border rounded px-2 h-8"
           />
         </label>
 
@@ -346,70 +490,38 @@ const files = filesRaw.map((f) => {
           <select
             name="projectId"
             defaultValue={projectIdFilterAllowed || ""}
-            className="border rounded px-2 py-1"
+            className="border rounded px-2 h-8"
           >
             <option value="">All projects</option>
             {projectOptions.map((p) => (
-              <option key={p.id} value={p.id}>
-                {p.name}
-              </option>
+              <option key={p.id} value={p.id}>{p.name}</option>
             ))}
           </select>
         </label>
-        <label className="text-sm">
-          <div className="text-slate-600">From (UTC)</div>
-          <input
-            type="date"
-            name="from"
-            defaultValue={fromParam || ""}
-            className="border rounded px-2 py-1"
-          />
-        </label>
 
         <label className="text-sm">
-          <div className="text-slate-600">To (UTC)</div>
-          <input
-            type="date"
-            name="to"
-            defaultValue={toParam || ""}
-            className="border rounded px-2 py-1"
-          />
-        </label>
-        <label className="text-sm">
           <div className="text-slate-600">Folder</div>
-          <select
-            name="folder"
-            defaultValue={folderParam || ""}
-            className="border rounded px-2 py-1"
-          >
+          <select name="folder" defaultValue={folderParam || ""} className="border rounded px-2 h-8">
             <option value="">All folders</option>
             {folderOptions.map((f) => (
-              <option key={f} value={f}>
-                {f}
-              </option>
+              <option key={f} value={f}>{f}</option>
             ))}
           </select>
         </label>
 
         <label className="text-sm">
           <div className="text-slate-600">Site</div>
-          <select
-            name="site"
-            defaultValue={siteParam || ""}
-            className="border rounded px-2 py-1"
-          >
+          <select name="site" defaultValue={siteParam || ""} className="border rounded px-2 h-8">
             <option value="">All sites</option>
             {siteOptions.map((s) => (
-              <option key={s} value={s}>
-                {s}
-              </option>
+              <option key={s} value={s}>{s}</option>
             ))}
           </select>
         </label>
 
         <label className="text-sm">
           <div className="text-slate-600">Sort by</div>
-          <select name="sort" defaultValue={sortKey} className="border rounded px-2 py-1">
+          <select name="sort" defaultValue={sortKey} className="border rounded px-2 h-8">
             <option value="recordedAt">Recorded time</option>
             <option value="originalName">Filename</option>
             <option value="site">Site</option>
@@ -421,7 +533,7 @@ const files = filesRaw.map((f) => {
 
         <label className="text-sm">
           <div className="text-slate-600">Direction</div>
-          <select name="dir" defaultValue={dir} className="border rounded px-2 py-1">
+          <select name="dir" defaultValue={dir} className="border rounded px-2 h-8">
             <option value="asc">Asc</option>
             <option value="desc">Desc</option>
           </select>
@@ -429,7 +541,7 @@ const files = filesRaw.map((f) => {
 
         <label className="text-sm">
           <div className="text-slate-600">Page size</div>
-          <select name="size" defaultValue={size} className="border rounded px-2 py-1">
+          <select name="size" defaultValue={size} className="border rounded px-2 h-8">
             <option value="10">10</option>
             <option value="20">20</option>
             <option value="50">50</option>
@@ -438,10 +550,12 @@ const files = filesRaw.map((f) => {
         </label>
 
         <input type="hidden" name="page" value="1" />
-        <button type="submit" className="border rounded px-3 py-1">
+        <button type="submit" className="border rounded px-3 h-8 inline-flex items-center">
           Apply
         </button>
-      </form>
+      </div>
+    </form>
+
 
       {/* Stats */}
       <div className="text-sm text-slate-600">
@@ -452,7 +566,40 @@ const files = filesRaw.map((f) => {
         {folderParam && <> in folder <b>{folderParam}</b></>}
         {siteParam && <> at site <b>{siteParam}</b></>}.
       </div>
+      {/* Active filters */}
+        {(q || projectIdFilterAllowed || folderParam || siteParam || hasAbsDates || hasSeason) && (
+          <div className="flex flex-wrap gap-2 items-center text-xs text-slate-700">
+            <span className="mr-1">Active filters:</span>
 
+            {q && <Chip label="Search" value={q} href={href({ q: "" })} />}
+
+            {projectIdFilterAllowed && (
+              <Chip
+                label="Project"
+                value={projectOptions.find(p => p.id === projectIdFilterAllowed)?.name ?? projectIdFilterAllowed}
+                href={href({ projectId: "" })}
+              />
+            )}
+
+            {folderParam && <Chip label="Folder" value={folderParam} href={href({ folder: "" })} />}
+            {siteParam && <Chip label="Site" value={siteParam} href={href({ site: "" })} />}
+
+            {hasAbsDates && (
+              <Chip label="Date" value={`${fromParam || "…"} → ${toParam || "…"} (UTC)`} href={href({ from: "", to: "" })} />
+            )}
+
+            {hasSeason && (
+              <Chip label="Season" value={`${mdFromParam || "…"} → ${mdToParam || "…"} (MM-DD)`} href={href({ mdFrom: "", mdTo: "" })} />
+            )}
+
+            <Link
+              href={href({ q: "", projectId: "", site: "", folder: "", from: "", to: "", mdFrom: "", mdTo: "" })}
+              className="ml-2 text-slate-600 underline hover:text-slate-900"
+            >
+              Clear all
+            </Link>
+          </div>
+        )}
       {/* Grid */}
       <ul className="grid gap-3 md:grid-cols-2">
         {files.map((f) => {
