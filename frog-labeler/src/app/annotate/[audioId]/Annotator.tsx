@@ -69,6 +69,36 @@ async function updateSegment(segmentId: string, data: Partial<SegmentRow>): Prom
   if (!r.ok) throw new Error(`PUT /api/segments/${segmentId} -> ${r.status}`);
   return r.json();
 }
+function screenToSpectroX(
+  e: React.MouseEvent<HTMLDivElement>,
+  containerRef: React.RefObject<HTMLDivElement>,
+  zoom: number
+): number {
+  const inner = containerRef.current;
+  if (!inner) return 0;
+  const sc = inner.parentElement as HTMLElement;
+  if (!sc) return 0;
+
+  const rect = inner.getBoundingClientRect();
+  const scrollLeft = sc.scrollLeft;
+  const xDisplay = e.clientX - rect.left + scrollLeft;
+  const xIntrinsic = xDisplay / zoom;
+
+  console.log("🎯 Click mapping (layout-based)", {
+    clientX: e.clientX,
+    rectLeft: rect.left,
+    scrollLeft,
+    zoom,
+    xDisplay,
+    xIntrinsic,
+  });
+
+  return Math.max(0, xIntrinsic);
+}
+
+
+
+
 
 /** ---------------- Component ---------------- */
 export default function Annotator({ audioId }: { audioId: string }) {
@@ -89,6 +119,9 @@ const overlayCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const [spectrogramPath, setSpectrogramPath] = useState<string | null>(null);
   const [selStart, setSelStart] = useState<number>(0);
   const [selEnd, setSelEnd] = useState<number>(0);
+  // after const [selEnd, setSelEnd] = useState<number>(0);
+  const [debugClickX, setDebugClickX] = useState<number | null>(null);
+
 
   const [dragPxStart, setDragPxStart] = useState<number | null>(null);
   const [dragPxEnd, setDragPxEnd] = useState<number | null>(null);
@@ -207,10 +240,19 @@ const overlayCanvasRef = useRef<HTMLCanvasElement | null>(null);
 
 const spectrogramCanvasRef = useRef<HTMLCanvasElement | null>(null);
 const [spectrogramImage, setSpectrogramImage] = useState<HTMLImageElement | null>(null);
+// Use image's intrinsic width and transform zoom consistently
 const naturalWidth = spectrogramImage?.naturalWidth ?? 1;
-const totalWidth = naturalWidth * zoom;
-const timeToX = (t: number) => (t / duration) * totalWidth;
-const xToTime = (x: number) => (x / totalWidth) * duration;
+
+// The actual *displayed* width, after scaling, equals image width * zoom
+const displayedWidth = naturalWidth * zoom;
+
+// Each pixel in the *unscaled* image represents this many seconds:
+const secondsPerPixel = duration / naturalWidth;
+
+// Convert between time and intrinsic (unscaled) image pixel coordinates
+const timeToX = (t: number) => t / secondsPerPixel;
+const xToTime = (x: number) => x * secondsPerPixel;
+
 
 /** ---------- Canvas Drawing ---------- */
 
@@ -289,28 +331,22 @@ if (!spectrogramImage && spectrogramCanvasRef.current) {
 }
 
 
+
 /** ------- Mouse interactions on spectrogram ------- */
 const onMouseDown = (e: React.MouseEvent<HTMLDivElement>) => {
-  const inner = containerRef.current;
-  if (!inner) return;
-  const scrollLeft = inner.parentElement?.scrollLeft ?? 0;
-  const rect = inner.getBoundingClientRect();
-  const x = e.clientX - rect.left + scrollLeft;
-  console.log("🖱️ MouseDown", { x, scrollLeft, rect });
+  const x = screenToSpectroX(e, containerRef, zoom);
+  setDebugClickX(x);   // highlight where code thinks you clicked
   setDragPxStart(x);
   setDragPxEnd(x);
 };
 
+
 const onMouseMove = (e: React.MouseEvent<HTMLDivElement>) => {
   if (dragPxStart == null) return;
-  const inner = containerRef.current;
-  if (!inner) return;
-  const scrollLeft = inner.parentElement?.scrollLeft ?? 0;
-  const rect = inner.getBoundingClientRect();
-  const x = e.clientX - rect.left + scrollLeft;
-  console.log("🖱️ MouseMove", { dragPxStart, x });
+  const x = screenToSpectroX(e, containerRef, zoom);
   setDragPxEnd(x);
 };
+
 
 const onMouseUp = () => {
   if (dragPxStart == null || dragPxEnd == null) {
@@ -384,63 +420,6 @@ const onMouseUp = () => {
     return () => window.removeEventListener("keydown", onKey);
   }, [duration, selStart, selEnd, hotkeyToLabelId]);
 
-/** ------- Auto-scroll to keep playhead in view ------- */
-/** ------- Auto-scroll + draw  ------- */
-/** ------- Draw overlays and keep playhead in view ------- */
-useEffect(() => {
-  const overlayCanvas = overlayCanvasRef.current;
-  const container = containerRef.current?.parentElement;
-  if (!overlayCanvas || !duration) return;
-
-  const ctx = overlayCanvas.getContext("2d");
-  if (!ctx) return;
-
-  const totalWidth = (spectrogramImage?.naturalWidth ?? 1) * zoom;
-
-  overlayCanvas.width = totalWidth;
-  overlayCanvas.height = spectrogramCanvasRef.current?.height ?? 192;
-
-
-  ctx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
-
-  const tToX = (t: number) => (t / duration) * totalWidth;
-
-  // --- draw selection ---
-  if (selEnd > selStart) {
-    const x1 = tToX(selStart);
-    const x2 = tToX(selEnd);
-    ctx.fillStyle = "rgba(0, 255, 0, 0.25)";
-    ctx.fillRect(x1, 0, x2 - x1, overlayCanvas.height);
-    ctx.strokeStyle = "rgba(0, 255, 0, 0.7)";
-    ctx.strokeRect(x1, 0, x2 - x1, overlayCanvas.height);
-  }
-
-  // --- draw playhead ---
-  const px = tToX(currentTime);
-  ctx.strokeStyle = "white";
-  ctx.lineWidth = 2;
-  ctx.beginPath();
-  ctx.moveTo(px, 0);
-  ctx.lineTo(px, overlayCanvas.height);
-  ctx.stroke();
-
-  // --- auto-scroll ---
-  if (container) {
-    const visibleWidth = container.clientWidth;
-    const leftEdge = container.scrollLeft;
-    const rightEdge = leftEdge + visibleWidth;
-    const margin = visibleWidth * 0.2;
-
-    if (px < leftEdge + margin) {
-      container.scrollTo({ left: Math.max(px - margin, 0), behavior: "auto" });
-    } else if (px > rightEdge - margin) {
-      container.scrollTo({
-        left: Math.min(px - visibleWidth + margin, totalWidth - visibleWidth),
-        behavior: "auto",
-      });
-    }
-  }
-}, [currentTime, selStart, selEnd, duration, zoom]);
 
 
 
@@ -633,12 +612,11 @@ useEffect(() => {
   ref={containerRef}
   className="relative h-full"
   style={{
-    width: `${naturalWidth}px`,           // real pixel width of the PNG
-    minWidth: "100%",
-    transform: `scale(${zoom}, 1)`,       // zoom horizontally via GPU
-    transformOrigin: "left top",
-    cursor: dragPxStart != null ? "crosshair" : "default",
-  }}
+  width: `${naturalWidth * zoom}px`,   // actual layout width scales with zoom
+  minWidth: "100%",
+  cursor: dragPxStart != null ? "crosshair" : "default",
+}}
+
 
   onMouseDown={onMouseDown}
   onMouseMove={onMouseMove}
@@ -658,19 +636,16 @@ useEffect(() => {
   height={naturalHeight}
   style={{ width: "100%", height: "100%", display: "block" }}
 />
-<canvas
-  ref={overlayCanvasRef}
-  width={naturalWidth}
-  height={naturalHeight}
-  style={{
-    position: "absolute",
-    top: 0,
-    left: 0,
-    pointerEvents: "none",
-    width: "100%",
-    height: "100%",
-  }}
-/>
+{debugClickX != null && (
+  <div
+    className="absolute top-0 bottom-0 w-[2px] bg-red-500 pointer-events-none"
+    style={{
+      left: `${debugClickX - (containerRef.current?.parentElement?.scrollLeft ?? 0)}px`,
+      zIndex: 10,
+    }}
+  />
+)}
+
 
 
     {/* Existing tagged segments */}
@@ -682,8 +657,8 @@ useEffect(() => {
           data-seg-box={s.id}
           className="absolute top-0 bottom-0 border-x-2 pointer-events-none opacity-50"
           style={{
-            left: `${timeToX(s.startS) - (containerRef.current?.parentElement?.scrollLeft ?? 0)}px`,
-            width: `${timeToX(s.endS) - timeToX(s.startS)}px`,
+            left: `${timeToX(s.startS) * zoom - (containerRef.current?.parentElement?.scrollLeft ?? 0)}px`,
+            width: `${(timeToX(s.endS) - timeToX(s.startS)) * zoom}px`,
             background: baseToRgba(color, 0.25),
             borderColor: color,
             zIndex: 3,
@@ -698,30 +673,32 @@ useEffect(() => {
       <div
         className="absolute top-0 bottom-0 bg-green-500/25 border-x border-green-400 pointer-events-none"
         style={{
-          left: `${timeToX(selStart) - (containerRef.current?.parentElement?.scrollLeft ?? 0)}px`,
-          width: `${timeToX(selEnd) - timeToX(selStart)}px`,
+          left: `${timeToX(selStart) * zoom - (containerRef.current?.parentElement?.scrollLeft ?? 0)}px`,
+          width: `${(timeToX(selEnd) - timeToX(selStart)) * zoom}px`,
           zIndex: 5,
         }}
       />
     )}
+
 
     {/* Drag overlay */}
     {dragPxStart != null && dragPxEnd != null && (
       <div
         className="absolute top-0 bottom-0 bg-blue-500/30 border-x border-blue-400 pointer-events-none"
         style={{
-          left: `${Math.min(dragPxStart, dragPxEnd) - (containerRef.current?.parentElement?.scrollLeft ?? 0)}px`,
-          width: `${Math.abs(dragPxEnd - dragPxStart)}px`,
+          left: `${Math.min(dragPxStart, dragPxEnd) * zoom - (containerRef.current?.parentElement?.scrollLeft ?? 0)}px`,
+          width: `${Math.abs(dragPxEnd - dragPxStart) * zoom}px`,
           zIndex: 6,
         }}
       />
     )}
 
+
     {/* Playhead */}
     <div
       className="absolute top-0 bottom-0 w-[2px] bg-white/80 pointer-events-none"
       style={{
-        left: `${timeToX(currentTime) - (containerRef.current?.parentElement?.scrollLeft ?? 0)}px`,
+        left: `${timeToX(currentTime) * zoom - (containerRef.current?.parentElement?.scrollLeft ?? 0)}px`,
         zIndex: 7,
       }}
     />
