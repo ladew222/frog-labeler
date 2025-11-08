@@ -1,29 +1,28 @@
-//src/app/annotate/[audioId]/Annotator.tsx
 "use client";
 
 import { useEffect, useMemo, useRef, useState, useCallback } from "react";
 import Link from "next/link";
-import WaveSurfer from "wavesurfer.js";
-import RegionsPlugin from "wavesurfer.js/dist/plugins/regions.esm.js";
-import SpectrogramPlugin from "wavesurfer.js/dist/plugins/spectrogram.esm.js";
 
+
+
+/** ---------------- Types ---------------- */
 type AudioRow = {
   id: string;
   originalName: string;
-  uri: string;
+  uri: string;               // e.g., /audio/…wav  (Range-enabled)
   recordedAt: string | null;
-  projectId: string; // ← new
+  projectId: string;
 };
-type LabelRow = { id: string; name: string; hotkey: string | null; color?: string | null };
 
+type LabelRow = {
+  id: string;
+  name: string;
+  hotkey: string | null;
+  color?: string | null;
+};
 
 const toNum = (v: number | "") =>
   v === "" || Number.isNaN(Number(v)) ? undefined : Number(v);
-
-
-
-// ⬇️ include optional fields we added to the DB
-// in Annotator.tsx
 
 type SegmentRow = {
   id: string;
@@ -32,42 +31,18 @@ type SegmentRow = {
   endS: number;
   labelId: string;
   label: { id: string; name: string; color: string | null; hotkey: string | null };
-  // optional fields
   individuals?: number | null;
   callingRate?: number | null;
   quality?: string | null;
   notes?: string | null;
   confidence?: number | null;
-  // NEW audit fields returned by the API
   createdAt?: string;
   createdBy?: { id: string; name: string | null; email: string | null } | null;
   updatedAt?: string | null;
   updatedBy?: { id: string; name: string | null; email: string | null } | null;
 };
 
-async function loadPeaks(uri: string): Promise<number[] | number[][] | null> {
-  const r = await fetch(`/api/peaks?uri=${encodeURIComponent(uri)}`, { cache: "no-store" });
-
-  if (r.status === 200) {
-    const json = await r.json();
-    const raw = Array.isArray(json) ? json : json.data;
-    if (!raw) return null;
-
-    // Normalize 8-bit 0–255 → -1..1
-    const normalize = (x: number) => (x - 128) / 128;
-
-    if (Array.isArray(raw[0])) {
-      return (raw as number[][]).map(ch => ch.map(normalize));
-    } else {
-      return (raw as number[]).map(normalize);
-    }
-  }
-
-  if (r.status === 202) return null; // still building
-  return null;
-}
-
-
+/** ---------------- API helpers (unchanged) ---------------- */
 async function fetchAudio(id: string): Promise<AudioRow> {
   const r = await fetch(`/api/audio/${id}`, { cache: "no-store" });
   if (!r.ok) throw new Error(`GET /api/audio/${id} -> ${r.status}`);
@@ -80,13 +55,11 @@ async function fetchLabels(projectId: string): Promise<LabelRow[]> {
   if (!r.ok) throw new Error(`GET /api/labels -> ${r.status}`);
   return r.json();
 }
-
 async function fetchSegments(audioId: string): Promise<SegmentRow[]> {
   const r = await fetch(`/api/audio/${audioId}/segments`, { cache: "no-store" });
   if (!r.ok) throw new Error(`GET /api/audio/${audioId}/segments -> ${r.status}`);
   return r.json();
 }
-
 async function updateSegment(segmentId: string, data: Partial<SegmentRow>): Promise<SegmentRow> {
   const r = await fetch(`/api/segments/${segmentId}`, {
     method: "PUT",
@@ -97,120 +70,74 @@ async function updateSegment(segmentId: string, data: Partial<SegmentRow>): Prom
   return r.json();
 }
 
-
+/** ---------------- Component ---------------- */
 export default function Annotator({ audioId }: { audioId: string }) {
-  const containerRef = useRef<HTMLDivElement | null>(null);
-  const spectroRef = useRef<HTMLDivElement | null>(null);
-  const wsRef = useRef<WaveSurfer | null>(null);
-  const regionsRef = useRef<ReturnType<typeof RegionsPlugin.create> | null>(null);
+  const containerRef = useRef<HTMLDivElement | null>(null); // inner zoomed spectrogram
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+  // Canvas references
+const overlayCanvasRef = useRef<HTMLCanvasElement | null>(null);
+
+  const rAF = useRef<number | null>(null);
+
+  const [audio, setAudio] = useState<AudioRow | null>(null);
+  const [labels, setLabels] = useState<LabelRow[]>([]);
+  const [segments, setSegments] = useState<SegmentRow[]>([]);
+  const [err, setErr] = useState<string | null>(null);
+
+  const [duration, setDuration] = useState<number>(0);
+  const [currentTime, setCurrentTime] = useState<number>(0);
+  const [spectrogramPath, setSpectrogramPath] = useState<string | null>(null);
+  const [selStart, setSelStart] = useState<number>(0);
+  const [selEnd, setSelEnd] = useState<number>(0);
+
+  const [dragPxStart, setDragPxStart] = useState<number | null>(null);
+  const [dragPxEnd, setDragPxEnd] = useState<number | null>(null);
+
+  const [zoom, setZoom] = useState(1);
+  // ... rest of your state unchanged ...
+  useEffect(() => {
+  console.log("🔍 Zoom changed →", zoom);
+}, [zoom]);
 
 
-  // ---- helpers that need access to wsRef/regionsRef ----
 
-const shortId = (id: string) => id.slice(-4);
+  /** Optional fields for the *next* tag */
+  const [individuals, setIndividuals] = useState<number | "">("");
+  const [callingRate, setCallingRate] = useState<number | "">("");
+  const [quality, setQuality] = useState<string>("");
+  const [notes, setNotes] = useState<string>("");
+  const [confidence, setConfidence] = useState<number | "">("");
 
-function getRegionBySegmentId(segId: string) {
-  const regions = regionsRef.current as any;
-  if (!regions) return null;
-  if (typeof regions.getRegion === "function") return regions.getRegion("seg_" + segId) ?? null;
-  const list = regions.getRegions?.() ?? [];
-  return list.find((r: any) => r.id === "seg_" + segId) ?? null;
-}
-
-function focusRegion(segId: string, play = false) {
-  const ws = wsRef.current;
-  const r = getRegionBySegmentId(segId);
-  if (!ws || !r) return;
-  const { start, end } = r;
-  ws.setTime(start + Math.min(0.05, Math.max(0, end - start) / 2));
-  if (play) ws.play(start, end);
-  try {
-    const el = (r as any).element as HTMLElement | undefined;
-    el?.classList.add("ring-2", "ring-amber-400");
-    setTimeout(() => el?.classList.remove("ring-2", "ring-amber-400"), 600);
-  } catch {}
-}
-
-function highlightRegion(segId: string, on: boolean) {
-  const r = getRegionBySegmentId(segId);
-  if (!r) return;
-  try {
-    const el = (r as any).element as HTMLElement | undefined;
-    if (on) el?.classList.add("ring-2", "ring-sky-400");
-    else el?.classList.remove("ring-2", "ring-sky-400");
-  } catch {}
-}
+  /** Editing row state */
+  const [editingId, setEditingId] = useState<string | null>(null);
+  type Draft = {
+    labelId?: string;
+    individuals?: number | "";
+    callingRate?: number | "";
+    quality?: string;
+    notes?: string;
+    confidence?: number | "";
+  };
+  const [draft, setDraft] = useState<Draft>({});
+  const [saving, setSaving] = useState(false);
+  const [savingEdit, setSavingEdit] = useState(false);
+  const [toast, setToast] = useState<string | null>(null);
 
 
-const pendingId = "__pending";
 
-const [audio, setAudio] = useState<AudioRow | null>(null);
-const [labels, setLabels] = useState<LabelRow[]>([]);
-const [segments, setSegments] = useState<SegmentRow[]>([]);
-const [err, setErr] = useState<string | null>(null);
-
-const [duration, setDuration] = useState<number>(0);
-const [selStart, setSelStart] = useState<number>(0);
-const [selEnd, setSelEnd] = useState<number>(0);
-
-const [saving, setSaving] = useState(false);
-const [toast, setToast] = useState<string | null>(null);
-
-// ⬇️ NEW: local inputs that apply to the *next* tag you save
-const [individuals, setIndividuals] = useState<number | "">("");
-const [callingRate, setCallingRate] = useState<number | "">("");
-const [quality, setQuality] = useState<string>("");
-const [notes, setNotes] = useState<string>("");
-const [confidence, setConfidence] = useState<number | "">("");
-
-  // which row is being edited
-const [editingId, setEditingId] = useState<string | null>(null);
-
-// working copy of fields while editing
-type Draft = {
-  labelId?: string;          // ← add this line
-  individuals?: number | "";
-  callingRate?: number | "";
-  quality?: string;
-  notes?: string;
-  confidence?: number | "";
-};
-
-const [draft, setDraft] = useState<Draft>({});
-const [savingEdit, setSavingEdit] = useState(false);
-
-function startEdit(s: SegmentRow) {
-  setEditingId(s.id);
-  setDraft({
-    labelId: s.labelId,       // ← NEW
-    individuals: s.individuals ?? "",
-    callingRate: s.callingRate ?? "",
-    quality: s.quality ?? "",
-    notes: s.notes ?? "",
-    confidence: s.confidence ?? "",
-  });
-}
-
-function cancelEdit() {
-  setEditingId(null);
-  setDraft({});
-}
-
+  /** ------- Load audio + labels + segs, set spectrogram URL ------- */
   useEffect(() => {
     (async () => {
       try {
-        // 1) get the audio (must include projectId from the API)
         const a = await fetchAudio(audioId);
-
-        // 2) fetch labels scoped to that project + the segments
         const [ls, segs] = await Promise.all([
           fetchLabels(a.projectId),
           fetchSegments(audioId),
         ]);
-
         setAudio(a);
         setLabels(ls);
         setSegments(segs);
+        setSpectrogramPath(`/api/spectrogram?uri=${encodeURIComponent(a.uri)}`);
       } catch (e: any) {
         setErr(e?.message ?? "Failed to load");
         console.error(e);
@@ -218,294 +145,306 @@ function cancelEdit() {
     })();
   }, [audioId]);
 
-
+  /** ------- Build label maps for hotkeys etc. ------- */
   const labelById = useMemo(() => {
     const m: Record<string, LabelRow> = {};
     for (const l of labels) m[l.id] = l;
     return m;
   }, [labels]);
-
   const hotkeyToLabelId = useMemo(() => {
     const m: Record<string, string> = {};
     for (const l of labels) if (l.hotkey) m[l.hotkey] = l.id;
     return m;
   }, [labels]);
 
+  /** ------- Wire up <audio> element ------- */
+  useEffect(() => {
+    const el = audioRef.current;
+    if (!audio || !el) return;
 
- // ----- WaveSurfer init -----
-useEffect(() => {
-  if (!audio || !containerRef.current || !spectroRef.current) return;
-
-  let ws: WaveSurfer | null = null;
-  let cancelled = false;
-
-  (async () => {
-    // Use the same /audio/... URL your API serves (Range-enabled)
-    const uri = audio.uri; // should already look like /audio/<folder>/<...>.wav
-
-    // Try to get cached peaks
-    const peaks = await loadPeaks(uri);
-
-    ws = WaveSurfer.create({
-      container: containerRef.current!,
-      height: 160,
-      waveColor: "#94a3b8",
-      progressColor: "#22c55e",
-      cursorColor: "#0f172a",
-      backend: "MediaElement",
-      partialRender: true,          // helps large files
-      minPxPerSec: 50,
-      url: uri,                     // stream with Range
-      peaks: peaks || undefined,    // instant draw if cached
-    });
-
-    const regions = ws.registerPlugin(RegionsPlugin.create({ dragSelection: false }));
-    regionsRef.current = regions;
-
-    // keep sliders in sync when user drags/resizes the pending region
-    const EPS = 1e-4;
-    const syncFromRegion = (r: any) => {
-      if (!r || String(r.id) !== pendingId) return;
-      if (Math.abs(r.start - selStart) > EPS) setSelStart(r.start);
-      if (Math.abs(r.end - selEnd) > EPS) setSelEnd(r.end);
-    };
-    regions.on("region-updated", syncFromRegion);
-    regions.on("region-update-end", syncFromRegion);
-
-    // handle clicks on regions → scroll and flash table row
-    const onRegionClicked = (r: any) => {
-      const id = String(r.id || "");
-      if (!id.startsWith("seg_")) return;
-      const segId = id.slice(4);
-      const row = document.querySelector<HTMLTableRowElement>(`[data-seg-row="${segId}"]`);
-      if (row) {
-        row.scrollIntoView({ block: "center", behavior: "smooth" });
-        row.classList.add("bg-yellow-50");
-        setTimeout(() => row.classList.remove("bg-yellow-50"), 800);
-      }
-    };
-    regions.on("region-clicked", onRegionClicked);
-
-    // Lighter spectrogram (faster to render)
-    const t0 = performance.now();
-    const spectro = SpectrogramPlugin.create({
-      container: spectroRef.current!,
-      height: 160,     // was 220
-      labels: false,   // hide frequency labels
-      fftSamples: 1024, // was 2048; fewer bins = faster
-      pixelRatio: 1,   // avoid extra work on HiDPI
-      // frequencyMax: 8000, // optional: cap top freq for more speed
-    });
-    spectro.once?.("ready", () => {
-      console.log("spectrogram ready in", Math.round(performance.now() - t0), "ms");
-    });
-    ws.registerPlugin(spectro);
-
-
-    wsRef.current = ws;
-
-    ws.on("error", (e: any) => {
-      if (e?.name === "AbortError") return;
-      console.error("WaveSurfer error:", e);
-    });
-
-    ws.on("ready", () => {
-      if (cancelled) return;
-      const d = ws!.getDuration() || 0;
-      setDuration(d);
-      const start = 0;
-      const end = Math.min(1, Math.max(0.05, d));
-      setSelStart(start);
+    el.src = audio.uri;
+    const onLoaded = () => {
+      setDuration(el.duration || 0);
+      // default 1-second selection at start
+      const end = Math.min(1, Math.max(0.05, el.duration || 1));
+      setSelStart(0);
       setSelEnd(end);
-      syncPendingRegion(start, end);
+    };
+    const onTime = () => setCurrentTime(el.currentTime);
 
-      // draw saved regions
-      for (const s of segments) {
-        const base = s.label.color ?? "#22c55e";
-        const col = base.startsWith("rgba") || base.startsWith("rgb") ? base : baseToRgba(base, 0.25);
-        regions.addRegion({
-          id: "seg_" + s.id,
-          start: s.startS,
-          end: s.endS,
-          color: col,
-          content: chipEl(`${s.label.name} · …${shortId(s.id)}`, base),
-          drag: false,
-          resize: false,
-        });
-      }
+    el.addEventListener("loadedmetadata", onLoaded);
+    el.addEventListener("timeupdate", onTime);
+    el.addEventListener("seeking", onTime);
+    el.addEventListener("seeked", onTime);
+
+    // RAF keeps the playhead bar super smooth while playing
+    const tick = () => {
+      setCurrentTime(el.currentTime);
+      rAF.current = requestAnimationFrame(tick);
+    };
+    const onPlay = () => (rAF.current = requestAnimationFrame(tick));
+    const onPause = () => {
+      if (rAF.current) cancelAnimationFrame(rAF.current);
+      rAF.current = null;
+    };
+    el.addEventListener("play", onPlay);
+    el.addEventListener("pause", onPause);
+
+    return () => {
+      el.removeEventListener("loadedmetadata", onLoaded);
+      el.removeEventListener("timeupdate", onTime);
+      el.removeEventListener("seeking", onTime);
+      el.removeEventListener("seeked", onTime);
+      el.removeEventListener("play", onPlay);
+      el.removeEventListener("pause", onPause);
+      if (rAF.current) cancelAnimationFrame(rAF.current);
+      rAF.current = null;
+    };
+  }, [audio]);
+
+  /** ------- Pixel <-> time helpers ------- */
+// === Use native spectrogram width, not PX_PER_SEC ===
+
+const spectrogramCanvasRef = useRef<HTMLCanvasElement | null>(null);
+const [spectrogramImage, setSpectrogramImage] = useState<HTMLImageElement | null>(null);
+const naturalWidth = spectrogramImage?.naturalWidth ?? 1;
+const totalWidth = naturalWidth * zoom;
+const timeToX = (t: number) => (t / duration) * totalWidth;
+const xToTime = (x: number) => (x / totalWidth) * duration;
+
+/** ---------- Canvas Drawing ---------- */
+
+const naturalHeight = spectrogramImage?.naturalHeight ?? 192;
+
+
+
+// Load the spectrogram image once
+/** ------- Load spectrogram image after audio duration is known ------- */
+useEffect(() => {
+  if (!spectrogramPath || duration === 0) return;
+  console.log("🖼️ Loading spectrogram:", spectrogramPath);
+
+  const img = new Image();
+  img.onload = () => {
+    console.log("✅ Spectrogram loaded", {
+      width: img.naturalWidth,
+      height: img.naturalHeight,
     });
+    setSpectrogramImage(img);
+  };
+  img.crossOrigin = "anonymous"; // handles local + deployed CORS
+  img.onload = () => {
+    console.log("✅ Spectrogram loaded OK", img.src);
+    setSpectrogramImage(img);
+  };
+  img.onerror = () => {
+    console.error("❌ Failed to load spectrogram image:", img.src);
+  };
+  img.src = `${spectrogramPath}&t=${Date.now()}`; // cache-bust
 
-    // If peaks weren’t ready (202), poll once to attach them after a few sec
-    if (!peaks) {
-      setTimeout(async () => {
-        if (!ws || cancelled) return;
-        try {
-          const again = await loadPeaks(uri);
-          if (again && ws.setPeaks) ws.setPeaks(again);
-        } catch {}
-      }, 3000);
-    }
+}, [spectrogramPath, duration]);
 
+/** ------- Redraw spectrogram on zoom or when image/duration ready ------- */
+/** ------- Redraw spectrogram on zoom or when image/duration ready ------- */
+/** ------- Draw spectrogram at native size ------- */
+useEffect(() => {
+  if (!spectrogramImage || !duration || !isFinite(duration)) return;
+
+  const canvas = spectrogramCanvasRef.current;
+  if (!canvas) return;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return;
+
+  const { naturalWidth, naturalHeight } = spectrogramImage;
+
+  // Use native image dimensions — do NOT upscale
+  canvas.width = naturalWidth;
+  canvas.height = naturalHeight;
+
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(spectrogramImage, 0, 0);
+
+  console.log(`🎨 Drawn at native width ${naturalWidth}`);
+
+  // Tell overlays to use this width instead of PX_PER_SEC
+  // (you’ll use this when converting time <-> x)
+}, [spectrogramImage]);
+
+
+
+
+
+
+
+// fallback message if image not yet loaded
+if (!spectrogramImage && spectrogramCanvasRef.current) {
+  const ctx = spectrogramCanvasRef.current.getContext("2d");
+  if (ctx) {
+    ctx.fillStyle = "#000";
+    ctx.fillRect(0, 0, spectrogramCanvasRef.current.width, spectrogramCanvasRef.current.height);
+    ctx.fillStyle = "#ccc";
+    ctx.fillText("Loading spectrogram...", 10, 20);
+  }
+}
+
+
+/** ------- Mouse interactions on spectrogram ------- */
+const onMouseDown = (e: React.MouseEvent<HTMLDivElement>) => {
+  const inner = containerRef.current;
+  if (!inner) return;
+  const scrollLeft = inner.parentElement?.scrollLeft ?? 0;
+  const rect = inner.getBoundingClientRect();
+  const x = e.clientX - rect.left + scrollLeft;
+  console.log("🖱️ MouseDown", { x, scrollLeft, rect });
+  setDragPxStart(x);
+  setDragPxEnd(x);
+};
+
+const onMouseMove = (e: React.MouseEvent<HTMLDivElement>) => {
+  if (dragPxStart == null) return;
+  const inner = containerRef.current;
+  if (!inner) return;
+  const scrollLeft = inner.parentElement?.scrollLeft ?? 0;
+  const rect = inner.getBoundingClientRect();
+  const x = e.clientX - rect.left + scrollLeft;
+  console.log("🖱️ MouseMove", { dragPxStart, x });
+  setDragPxEnd(x);
+};
+
+const onMouseUp = () => {
+  if (dragPxStart == null || dragPxEnd == null) {
+    console.warn("⚠️ MouseUp ignored — no drag active");
+    setDragPxStart(null);
+    setDragPxEnd(null);
+    return;
+  }
+
+  const startPx = Math.min(dragPxStart, dragPxEnd);
+  const endPx = Math.max(dragPxStart, dragPxEnd);
+  const tS = xToTime(startPx);
+  const tE = Math.max(tS + 0.02, xToTime(endPx));
+
+  console.log("🖱️ MouseUp", { startPx, endPx, tS, tE });
+
+  setSelStart(tS);
+  setSelEnd(Math.min(duration, tE));
+  setDragPxStart(null);
+  setDragPxEnd(null);
+};
+
+
+
+  /** ------- Keyboard shortcuts ------- */
+  useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.code === "Space") { e.preventDefault(); ws!.playPause(); return; }
+      const el = audioRef.current;
+      if (!el) return;
+
+      if (e.code === "Space") {
+        e.preventDefault();
+        if (el.paused) el.play().catch(() => {});
+        else el.pause();
+        return;
+      }
+      if (e.key === "l") {
+        // loop current selection
+        const start = Math.max(0, selStart);
+        const end = Math.min(duration || selEnd, selEnd);
+        if (end > start) {
+          el.currentTime = start;
+          el.play().catch(() => {});
+          const watcher = () => {
+            if (el.currentTime >= end) el.currentTime = start;
+            if (!el.paused) requestAnimationFrame(watcher);
+          };
+          requestAnimationFrame(watcher);
+        }
+        return;
+      }
       if (e.key === "[") {
-        const t = ws!.getCurrentTime();
-        const end = Math.max(t + 0.05, selEnd);
-        const s = Math.min(t, end - 0.01);
-        setSelStart(s); setSelEnd(end); syncPendingRegion(s, end); return;
+        const t = el.currentTime ?? selStart;
+        const v = Math.min(t, selEnd - 0.01);
+        setSelStart(Math.max(0, v));
+        return;
       }
       if (e.key === "]") {
-        const t = ws!.getCurrentTime();
-        const s = Math.min(t, selStart);
-        const e2 = Math.max(t, s + 0.05);
-        setSelStart(s); setSelEnd(e2); syncPendingRegion(s, e2); return;
+        const t = el.currentTime ?? selEnd;
+        const v = Math.max(t, selStart + 0.01);
+        setSelEnd(Math.min(duration || v, v));
+        return;
       }
-      if (e.key === "l") { ws!.play(selStart, selEnd); return; }
       const labelId = hotkeyToLabelId[e.key];
-      if (labelId) { e.preventDefault(); void saveCurrentSelection(labelId); }
+      if (labelId) {
+        e.preventDefault();
+        void saveCurrentSelection(labelId);
+      }
     };
     window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [duration, selStart, selEnd, hotkeyToLabelId]);
 
-    // cleanup
-    return () => {
-      cancelled = true;
-      window.removeEventListener("keydown", onKey);
-      try {
-        regions.off?.("region-updated", syncFromRegion);
-        regions.off?.("region-update-end", syncFromRegion);
-        regions.off?.("region-clicked", onRegionClicked);
-      } catch {}
-      try {
-        // @ts-ignore
-        const el: HTMLMediaElement | undefined = ws?.getMediaElement?.();
-        if (el) { el.pause(); el.src = ""; el.load(); }
-        ws?.unAll();
-        setTimeout(() => { try { ws?.destroy(); } catch {} }, 0);
-      } catch {}
-      wsRef.current = null;
-      regionsRef.current = null;
-    };
-  })();
+/** ------- Auto-scroll to keep playhead in view ------- */
+/** ------- Auto-scroll + draw  ------- */
+/** ------- Draw overlays and keep playhead in view ------- */
+useEffect(() => {
+  const overlayCanvas = overlayCanvasRef.current;
+  const container = containerRef.current?.parentElement;
+  if (!overlayCanvas || !duration) return;
 
-  // deps: *don’t* include segments to avoid re-initializing WS
-  // segments are drawn in a separate effect (your code below)
-}, [audio, hotkeyToLabelId]);
+  const ctx = overlayCanvas.getContext("2d");
+  if (!ctx) return;
+
+  const totalWidth = (spectrogramImage?.naturalWidth ?? 1) * zoom;
+
+  overlayCanvas.width = totalWidth;
+  overlayCanvas.height = spectrogramCanvasRef.current?.height ?? 192;
 
 
-  // keep a single pending region instance
-  const pendingRegionRef = useRef<any>(null);
+  ctx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
 
-  // Re-render saved segments when `segments` changes
-  useEffect(() => {
-    const regions = regionsRef.current;
-    const ws = wsRef.current;
-    if (!regions || !ws) return;
+  const tToX = (t: number) => (t / duration) * totalWidth;
 
-    // Remove existing saved regions (but keep the pending one)
-    regions.getRegions().forEach((r: any) => {
-      if (r.id && String(r.id).startsWith("seg_")) r.remove();
-    });
+  // --- draw selection ---
+  if (selEnd > selStart) {
+    const x1 = tToX(selStart);
+    const x2 = tToX(selEnd);
+    ctx.fillStyle = "rgba(0, 255, 0, 0.25)";
+    ctx.fillRect(x1, 0, x2 - x1, overlayCanvas.height);
+    ctx.strokeStyle = "rgba(0, 255, 0, 0.7)";
+    ctx.strokeRect(x1, 0, x2 - x1, overlayCanvas.height);
+  }
 
+  // --- draw playhead ---
+  const px = tToX(currentTime);
+  ctx.strokeStyle = "white";
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(px, 0);
+  ctx.lineTo(px, overlayCanvas.height);
+  ctx.stroke();
 
+  // --- auto-scroll ---
+  if (container) {
+    const visibleWidth = container.clientWidth;
+    const leftEdge = container.scrollLeft;
+    const rightEdge = leftEdge + visibleWidth;
+    const margin = visibleWidth * 0.2;
 
-    // Draw current saved segments
-    for (const s of segments) {
-      const base = s.label.color ?? "#22c55e";
-      const col = base.startsWith("rgba") || base.startsWith("rgb") ? base : baseToRgba(base, 0.25);
-      regions.addRegion({
-        id: "seg_" + s.id,
-        start: s.startS,
-        end: s.endS,
-        color: col,
-        content: chipEl(`${s.label.name} · …${shortId(s.id)}`, base),
-        drag: false,
-        resize: false,
+    if (px < leftEdge + margin) {
+      container.scrollTo({ left: Math.max(px - margin, 0), behavior: "auto" });
+    } else if (px > rightEdge - margin) {
+      container.scrollTo({
+        left: Math.min(px - visibleWidth + margin, totalWidth - visibleWidth),
+        behavior: "auto",
       });
     }
-
-    if (duration > 0) syncPendingRegion(selStart, selEnd);
-  }, [segments, duration]); // only redraw on segment list or duration change
-
-  function syncPendingRegion(start: number, end: number) {
-    const regions = regionsRef.current;
-    if (!regions) return;
-    const minLen = 0.02;
-    const s = Math.max(0, Math.min(start, end - minLen));
-    const e = Math.max(s + minLen, end);
-    const el = chipEl("pending", "rgba(34,197,94,0.5)");
-
-    const r = pendingRegionRef.current;
-    if (r && typeof r.update === "function") {
-      r.update({ start: s, end: e, color: "rgba(34,197,94,0.28)", content: el, drag: true, resize: true });
-      return;
-    }
-    regions.getRegions().forEach((rg: any) => { if (rg.id === pendingId) rg.remove(); });
-    const created = regions.addRegion({
-      id: pendingId, start: s, end: e, color: "rgba(34,197,94,0.28)", content: el, drag: true, resize: true,
-    });
-    pendingRegionRef.current = created;
   }
-
-  function clearPending() {
-    try { pendingRegionRef.current?.remove(); } catch {}
-    pendingRegionRef.current = null;
-  }
-
-  useEffect(() => { if (duration > 0) syncPendingRegion(selStart, selEnd); }, [selStart, selEnd, duration]);
-
- async function saveEdit(segmentId: string) {
-    setSavingEdit(true);
-    try {
-      const nextLabelId = draft.labelId; // may be undefined → keep old
-      const payload: Partial<SegmentRow> = {
-        individuals: toNum(draft.individuals ?? ""),
-        callingRate: toNum(draft.callingRate ?? ""),
-        quality: (draft.quality ?? "").trim() || null,
-        notes: (draft.notes ?? "").trim() || null,
-        confidence: toNum(draft.confidence ?? ""),
-        ...(nextLabelId ? { labelId: nextLabelId } : {}),   // ← allow label change
-      };
-
-      const updated = await updateSegment(segmentId, payload);
-
-      // Update local state (including label object if labelId changed)
-      setSegments((prev) =>
-        prev.map((s) => {
-          if (s.id !== segmentId) return s;
-          const newLabelId = nextLabelId ?? s.labelId;
-          const newLabelObj = labelById[newLabelId] ?? s.label;
-          return { ...s, ...updated, labelId: newLabelId, label: newLabelObj };
-        })
-      );
-
-      // Also update the existing WaveSurfer region bubble color/content
-      const r = getRegionBySegmentId(segmentId);
-      if (r) {
-        const newLabelId = nextLabelId ?? segments.find((x) => x.id === segmentId)?.labelId;
-        const lbl = (newLabelId && labelById[newLabelId]) || undefined;
-        const base = lbl?.color ?? "#22c55e";
-        const col = base.startsWith("rgba") || base.startsWith("rgb") ? base : baseToRgba(base, 0.25);
-        r.update?.({
-          color: col,
-          content: chipEl(`${lbl?.name ?? newLabelId} · …${segmentId.slice(-4)}`, base),
-        });
-      }
-
-      setEditingId(null);
-      setDraft({});
-      setToast("Updated ✓");
-      setTimeout(() => setToast(null), 1000);
-    } catch (e) {
-      console.error(e);
-      setToast("Update failed");
-      setTimeout(() => setToast(null), 1200);
-    } finally {
-      setSavingEdit(false);
-    }
-  }
+}, [currentTime, selStart, selEnd, duration, zoom]);
 
 
 
+  /** ------- Save, Edit, Delete ------- */
   async function saveCurrentSelection(labelId: string) {
     if (!audio) return;
     const start = Math.max(0, selStart);
@@ -522,33 +461,23 @@ useEffect(() => {
           startS: start,
           endS: end,
           labelId,
-          // ⬇️ include optional fields if provided
           individuals: toNum(individuals),
           callingRate: toNum(callingRate),
           quality: quality.trim() ? quality.trim() : undefined,
           notes: notes.trim() ? notes.trim() : undefined,
-          confidence: toNum(confidence), 
+          confidence: toNum(confidence),
         }),
       });
       if (!res.ok) throw new Error(`POST /api/audio/${audio.id}/segments -> ${res.status}`);
       const saved: SegmentRow = await res.json();
 
-      const base = labelById[labelId]?.color ?? "#22c55e";
-      const col = base.startsWith("rgba") || base.startsWith("rgb") ? base : baseToRgba(base, 0.25);
+      // add to table (label object included)
+      setSegments((prev) => [...prev, { ...saved, label: labelById[labelId] }]);
 
-      regionsRef.current?.addRegion({
-        id: "seg_" + saved.id,
-        start, end, color: col,
-        content: chipEl(`${labelById[labelId]?.name ?? "label"} · …${shortId(saved.id)}`, base),
-        drag: false, resize: false,
-      });
-
-      clearPending();
-      setSegments((prev) => [...prev, { ...saved, label: { ...labelById[labelId] } as any }]);
       setToast("Saved ✓");
       setTimeout(() => setToast(null), 1000);
 
-      // reset optional inputs after a successful save
+      // reset optional inputs after save
       setIndividuals("");
       setCallingRate("");
       setQuality("");
@@ -563,25 +492,12 @@ useEffect(() => {
     }
   }
 
-  
-
-  // delete handler INSIDE the component
   const handleDelete = useCallback(async (segmentId: string) => {
     if (!confirm("Delete this segment?")) return;
     try {
       const res = await fetch(`/api/segments/${segmentId}`, { method: "DELETE" });
-      if (!res.ok && res.status !== 204) throw new Error(`DELETE /api/segments/${segmentId} -> ${res.status}`);
-
-      let region: any;
-      // @ts-ignore
-      if (regionsRef.current?.getRegion) {
-        // @ts-ignore
-        region = regionsRef.current.getRegion("seg_" + segmentId);
-      } else {
-        region = regionsRef.current?.getRegions()?.find((r: any) => r.id === "seg_" + segmentId);
-      }
-      try { region?.remove(); } catch {}
-
+      if (!res.ok && res.status !== 204)
+        throw new Error(`DELETE /api/segments/${segmentId} -> ${res.status}`);
       setSegments((prev) => prev.filter((s) => s.id !== segmentId));
     } catch (e) {
       console.error(e);
@@ -589,12 +505,102 @@ useEffect(() => {
     }
   }, []);
 
-  const fmt = (x?: number | null) => (x == null ? "—" : x.toFixed(2));
+  function startEdit(s: SegmentRow) {
+    setEditingId(s.id);
+    setDraft({
+      labelId: s.labelId,
+      individuals: s.individuals ?? "",
+      callingRate: s.callingRate ?? "",
+      quality: s.quality ?? "",
+      notes: s.notes ?? "",
+      confidence: s.confidence ?? "",
+    });
+  }
+  function cancelEdit() {
+    setEditingId(null);
+    setDraft({});
+  }
+  async function saveEdit(segmentId: string) {
+    setSavingEdit(true);
+    try {
+      const nextLabelId = draft.labelId;
+      const payload: Partial<SegmentRow> = {
+        individuals: toNum(draft.individuals ?? ""),
+        callingRate: toNum(draft.callingRate ?? ""),
+        quality: (draft.quality ?? "").trim() || null,
+        notes: (draft.notes ?? "").trim() || null,
+        confidence: toNum(draft.confidence ?? ""),
+        ...(nextLabelId ? { labelId: nextLabelId } : {}),
+      };
+      const updated = await updateSegment(segmentId, payload);
 
+      setSegments((prev) =>
+        prev.map((s) => {
+          if (s.id !== segmentId) return s;
+          const newLabelId = nextLabelId ?? s.labelId;
+          const newLabelObj = labelById[newLabelId] ?? s.label;
+          return { ...s, ...updated, labelId: newLabelId, label: newLabelObj };
+        })
+      );
+
+      setEditingId(null);
+      setDraft({});
+      setToast("Updated ✓");
+      setTimeout(() => setToast(null), 1000);
+    } catch (e) {
+      console.error(e);
+      setToast("Update failed");
+      setTimeout(() => setToast(null), 1200);
+    } finally {
+      setSavingEdit(false);
+    }
+  }
+
+  /** ------- Helpers ------- */
+  const fmt = (x?: number | null) => (x == null ? "—" : x.toFixed(2));
+  const shortId = (id: string) => id.slice(-4);
+  const baseToRgba = (hex: string, alpha: number) => {
+    const shorthand = /^#?([a-f\d])([a-f\d])([a-f\d])$/i;
+    const full = hex.replace(shorthand, (_, r, g, b) => r + r + g + g + b + b);
+    const match = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(full);
+    if (!match) return hex;
+    const [, r, g, b] = match;
+    return `rgba(${parseInt(r, 16)}, ${parseInt(g, 16)}, ${parseInt(b, 16)}, ${alpha})`;
+  };
+
+  /** ------- Focus a region from table click ------- */
+  function focusRegion(segId: string, play = false) {
+    const seg = segments.find((s) => s.id === segId);
+    const el = audioRef.current;
+    if (!seg || !el) return;
+    const mid = seg.startS + Math.min(0.05, Math.max(0, seg.endS - seg.startS) / 2);
+    el.currentTime = mid;
+    if (play) el.play().catch(() => {});
+    // flash overlay rectangle
+    const dom = document.querySelector<HTMLElement>(`[data-seg-box="${segId}"]`);
+    if (dom) {
+      dom.classList.add("ring-2", "ring-amber-400");
+      setTimeout(() => dom.classList.remove("ring-2", "ring-amber-400"), 600);
+    }
+    const row = document.querySelector<HTMLTableRowElement>(`[data-seg-row="${segId}"]`);
+    row?.scrollIntoView({ block: "center", behavior: "smooth" });
+  }
+
+  /** ------- Hover highlight hooks on table rows ------- */
+  function highlightRegion(segId: string, on: boolean) {
+    const dom = document.querySelector<HTMLElement>(`[data-seg-box="${segId}"]`);
+    if (!dom) return;
+    if (on) dom.classList.add("ring-2", "ring-sky-400");
+    else dom.classList.remove("ring-2", "ring-sky-400");
+  }
+
+  /** ------- Render ------- */
   if (err) return <div className="p-6 text-red-600">Error: {err}</div>;
   if (!audio) return <div className="p-6">Loading…</div>;
 
-  
+  // computed selection overlay from drag (live preview)
+  const dragLeft = dragPxStart != null && dragPxEnd != null ? Math.min(dragPxStart, dragPxEnd) : null;
+  const dragWidth = dragPxStart != null && dragPxEnd != null ? Math.abs(dragPxEnd - dragPxStart) : null;
 
   return (
     <div className="p-6 space-y-4">
@@ -606,36 +612,189 @@ useEffect(() => {
         Annotate: <span className="font-mono">{audio.originalName}</span>
       </h1>
 
-      <div ref={containerRef} className="rounded border relative" />
-      <div ref={spectroRef} className="rounded border" />
+      {/* Spectrogram + overlay */}
+  {/* Zoom controls */}
+<div className="flex items-center gap-3 text-sm">
+  <label>Zoom:</label>
+  <input
+    type="range"
+    min={1}
+    max={10}
+    step={0.1}
+    value={zoom}
+    onChange={(e) => setZoom(parseFloat(e.target.value))}
+    className="w-48"
+  />
+  <span>{zoom.toFixed(1)}×</span>
+</div>
+{/* === Canvas-based spectrogram === */}
+<div className="relative border rounded overflow-x-auto bg-black" style={{ height: "12rem" }}>
+<div
+  ref={containerRef}
+  className="relative h-full"
+  style={{
+    width: `${naturalWidth}px`,           // real pixel width of the PNG
+    minWidth: "100%",
+    transform: `scale(${zoom}, 1)`,       // zoom horizontally via GPU
+    transformOrigin: "left top",
+    cursor: dragPxStart != null ? "crosshair" : "default",
+  }}
 
-      {/* Selection controls */}
+  onMouseDown={onMouseDown}
+  onMouseMove={onMouseMove}
+  onMouseUp={onMouseUp}
+  onMouseLeave={() => {
+    if (dragPxStart != null) {
+      console.warn("⚠️ Mouse left area during drag — cancelling");
+      setDragPxStart(null);
+      setDragPxEnd(null);
+    }
+  }}
+>
+
+ <canvas
+  ref={spectrogramCanvasRef}
+  width={naturalWidth}
+  height={naturalHeight}
+  style={{ width: "100%", height: "100%", display: "block" }}
+/>
+<canvas
+  ref={overlayCanvasRef}
+  width={naturalWidth}
+  height={naturalHeight}
+  style={{
+    position: "absolute",
+    top: 0,
+    left: 0,
+    pointerEvents: "none",
+    width: "100%",
+    height: "100%",
+  }}
+/>
+
+
+    {/* Existing tagged segments */}
+    {segments.map((s) => {
+      const color = s.label?.color ?? "#22c55e";
+      return (
+        <div
+          key={s.id}
+          data-seg-box={s.id}
+          className="absolute top-0 bottom-0 border-x-2 pointer-events-none opacity-50"
+          style={{
+            left: `${timeToX(s.startS) - (containerRef.current?.parentElement?.scrollLeft ?? 0)}px`,
+            width: `${timeToX(s.endS) - timeToX(s.startS)}px`,
+            background: baseToRgba(color, 0.25),
+            borderColor: color,
+            zIndex: 3,
+          }}
+          title={`${s.label?.name ?? "Unknown"}: ${fmt(s.startS)}–${fmt(s.endS)}s`}
+        />
+      );
+    })}
+
+    {/* Selection overlay */}
+    {duration > 0 && selEnd > selStart && dragPxStart == null && (
+      <div
+        className="absolute top-0 bottom-0 bg-green-500/25 border-x border-green-400 pointer-events-none"
+        style={{
+          left: `${timeToX(selStart) - (containerRef.current?.parentElement?.scrollLeft ?? 0)}px`,
+          width: `${timeToX(selEnd) - timeToX(selStart)}px`,
+          zIndex: 5,
+        }}
+      />
+    )}
+
+    {/* Drag overlay */}
+    {dragPxStart != null && dragPxEnd != null && (
+      <div
+        className="absolute top-0 bottom-0 bg-blue-500/30 border-x border-blue-400 pointer-events-none"
+        style={{
+          left: `${Math.min(dragPxStart, dragPxEnd) - (containerRef.current?.parentElement?.scrollLeft ?? 0)}px`,
+          width: `${Math.abs(dragPxEnd - dragPxStart)}px`,
+          zIndex: 6,
+        }}
+      />
+    )}
+
+    {/* Playhead */}
+    <div
+      className="absolute top-0 bottom-0 w-[2px] bg-white/80 pointer-events-none"
+      style={{
+        left: `${timeToX(currentTime) - (containerRef.current?.parentElement?.scrollLeft ?? 0)}px`,
+        zIndex: 7,
+      }}
+    />
+  </div>
+</div>
+
+
+
+      {/* Player controls */}
+      <audio ref={audioRef} className="w-full" controls />
+
+      {/* Selection info + actions */}
+      <div className="text-sm border rounded p-3">
+        <button
+          onClick={() => {
+            const el = audioRef.current;
+            if (!el) return;
+            if (el.paused) el.play().catch(() => {});
+            else el.pause();
+          }}
+          className="border px-2 py-1 rounded mr-2"
+        >
+          ▶/⏸
+        </button>
+        <button
+          onClick={() => {
+            const el = audioRef.current;
+            if (!el) return;
+            const start = Math.max(0, selStart);
+            const end = Math.min(duration || selEnd, selEnd);
+            if (!(end > start)) return;
+            el.currentTime = start;
+            el.play().catch(() => {});
+            const loop = () => {
+              if (el.currentTime >= end) el.currentTime = start;
+              if (!el.paused) requestAnimationFrame(loop);
+            };
+            requestAnimationFrame(loop);
+          }}
+          className="border px-2 py-1 rounded"
+        >
+          Loop sel
+        </button>
+        <span className="ml-3 text-slate-600">
+          Selection: <code>{fmt(selStart)}</code> → <code>{fmt(selEnd)}</code> /{" "}
+          <code>{fmt(duration)}</code> s
+        </span>
+      </div>
+
+      {/* Sliders for fine control */}
       <div className="text-sm border rounded p-3 space-y-2">
-        <div className="flex items-center gap-3">
-          <button type="button" className="border px-2 py-1 rounded" onClick={() => wsRef.current?.playPause()}>
-            ▶/⏸
-          </button>
-          <button type="button" className="border px-2 py-1 rounded" onClick={() => wsRef.current?.play(selStart, selEnd)}>
-            Loop sel
-          </button>
-          <span className="text-slate-600 ml-2">
-            Selection: <code>{fmt(selStart)}</code> → <code>{fmt(selEnd)}</code> / <code>{fmt(duration)}</code> s
-          </span>
-        </div>
-
         <div className="grid gap-2 md:grid-cols-2">
           <label className="flex items-center gap-2">
             Start
             <input
-              type="range" min={0} max={Math.max(0.01, duration)} step={0.01} value={selStart}
-              onChange={(e) => { const v = Math.min(parseFloat(e.target.value), selEnd - 0.01); setSelStart(Math.max(0, v)); }}
+              type="range"
+              min={0}
+              max={Math.max(0.01, duration)}
+              step={0.01}
+              value={selStart}
+              onChange={(e) => {
+                const v = Math.min(parseFloat(e.target.value), selEnd - 0.01);
+                setSelStart(Math.max(0, v));
+              }}
               className="w-full"
             />
             <code>{fmt(selStart)}</code>
             <button
-              type="button" className="border px-1 py-0.5 rounded" title="Set from playhead ["
+              type="button"
+              className="border px-1 py-0.5 rounded"
+              title="Set from playhead ["
               onClick={() => {
-                const t = wsRef.current?.getCurrentTime() ?? selStart;
+                const t = audioRef.current?.currentTime ?? selStart;
                 const v = Math.min(t, selEnd - 0.01);
                 setSelStart(Math.max(0, v));
               }}
@@ -647,15 +806,24 @@ useEffect(() => {
           <label className="flex items-center gap-2">
             End
             <input
-              type="range" min={0} max={Math.max(0.01, duration)} step={0.01} value={selEnd}
-              onChange={(e) => { const v = Math.max(parseFloat(e.target.value), selStart + 0.01); setSelEnd(Math.min(duration || v, v)); }}
+              type="range"
+              min={0}
+              max={Math.max(0.01, duration)}
+              step={0.01}
+              value={selEnd}
+              onChange={(e) => {
+                const v = Math.max(parseFloat(e.target.value), selStart + 0.01);
+                setSelEnd(Math.min(duration || v, v));
+              }}
               className="w-full"
             />
             <code>{fmt(selEnd)}</code>
             <button
-              type="button" className="border px-1 py-0.5 rounded" title="Set from playhead ]"
+              type="button"
+              className="border px-1 py-0.5 rounded"
+              title="Set from playhead ]"
               onClick={() => {
-                const t = wsRef.current?.getCurrentTime() ?? selEnd;
+                const t = audioRef.current?.currentTime ?? selEnd;
                 const v = Math.max(t, selStart + 0.01);
                 setSelEnd(Math.min(duration || v, v));
               }}
@@ -739,7 +907,6 @@ useEffect(() => {
         <span className="text-slate-600 mr-2">Tag as:</span>
         {labels.map((l) => (
           <button
-            type="button"
             key={l.id}
             className="border px-2 py-1 rounded"
             style={{ background: l.color ?? undefined }}
@@ -747,7 +914,8 @@ useEffect(() => {
             disabled={saving}
             title={l.hotkey ? `Hotkey: ${l.hotkey}` : ""}
           >
-            {l.name}{l.hotkey ? ` [${l.hotkey}]` : ""}
+            {l.name}
+            {l.hotkey ? ` [${l.hotkey}]` : ""}
           </button>
         ))}
         {saving && <span className="text-slate-500 ml-2">Saving…</span>}
@@ -775,201 +943,209 @@ useEffect(() => {
                 <th className="text-left p-2 border">Conf.</th>
                 <th className="text-left p-2 border">Notes</th>
                 <th className="text-left p-2 border">Actions</th>
-                
               </tr>
             </thead>
-           <tbody>
-            {segments
-              .slice()
-              .sort((a, b) => a.startS - b.startS)
-              .map((s, i) => {
-                const isEditing = editingId === s.id;
-                return (
-                  <tr
-                    key={s.id}
-                    data-seg-row={s.id}
-                    onMouseEnter={() => highlightRegion(s.id, true)}
-                    onMouseLeave={() => highlightRegion(s.id, false)}
-                  >
-                    <td className="p-2 border w-10 text-right">{i + 1}</td>
-                    <td className="p-2 border font-mono text-xs">
-                      <button
-                        type="button"
-                        className="underline"
-                        title={s.id}
-                        onClick={() => focusRegion(s.id, false)}
-                      >
-                        …{s.id.slice(-4)}
-                      </button>
-                    </td>
-
-                    <td className="p-2 border font-mono">{s.startS.toFixed(2)}</td>
-                    <td className="p-2 border font-mono">{s.endS.toFixed(2)}</td>
-                    <td className="p-2 border">
-                      {isEditing ? (
-                        <select
-                          className="border rounded px-2 py-1 w-full"
-                          value={draft.labelId ?? s.labelId}
-                          onChange={(e) => setDraft((d) => ({ ...d, labelId: e.target.value }))}
+            <tbody>
+              {segments
+                .slice()
+                .sort((a, b) => a.startS - b.startS)
+                .map((s, i) => {
+                  const isEditing = editingId === s.id;
+                  return (
+                    <tr
+                      key={s.id}
+                      data-seg-row={s.id}
+                      onMouseEnter={() => highlightRegion(s.id, true)}
+                      onMouseLeave={() => highlightRegion(s.id, false)}
+                    >
+                      <td className="p-2 border w-10 text-right">{i + 1}</td>
+                      <td className="p-2 border font-mono text-xs">
+                        <button
+                          type="button"
+                          className="underline"
+                          title={s.id}
+                          onClick={() => focusRegion(s.id, false)}
                         >
-                          {labels.map((l) => (
-                            <option key={l.id} value={l.id}>
-                              {l.name}
-                            </option>
-                          ))}
-                        </select>
-                      ) : (
-                        <span
-                          className="px-2 py-0.5 rounded"
-                          style={{ background: s.label?.color ?? "rgba(34,197,94,0.25)" }}
-                        >
-                          {s.label?.name ?? s.labelId}
-                        </span>
-                      )}
-                    </td>
-                    <td className="p-2 border">
-                      {s.updatedBy?.name || s.updatedBy?.email || s.createdBy?.name || s.createdBy?.email || "—"}
-                    </td>
+                          …{s.id.slice(-4)}
+                        </button>
+                      </td>
 
-                    {/* Individuals */}
-                    <td className="p-2 border text-center">
-                      {isEditing ? (
-                        <input
-                          type="number"
-                          min={0}
-                          className="border rounded px-2 py-1 w-20 text-right"
-                          value={draft.individuals ?? ""}
-                          onChange={(e) =>
-                            setDraft((d) => ({ ...d, individuals: e.target.value === "" ? "" : Number(e.target.value) }))
-                          }
-                        />
-                      ) : (
-                        s.individuals ?? "—"
-                      )}
-                    </td>
-
-                    {/* Rate */}
-                    <td className="p-2 border text-center">
-                      {isEditing ? (
-                        <input
-                          type="number"
-                          min={0}
-                          step="0.1"
-                          className="border rounded px-2 py-1 w-24 text-right"
-                          value={draft.callingRate ?? ""}
-                          onChange={(e) =>
-                            setDraft((d) => ({ ...d, callingRate: e.target.value === "" ? "" : Number(e.target.value) }))
-                          }
-                        />
-                      ) : s.callingRate != null ? (
-                        Number(s.callingRate).toFixed(2)
-                      ) : (
-                        "—"
-                      )}
-                    </td>
-
-                    {/* Quality */}
-                    <td className="p-2 border">
-                      {isEditing ? (
-                        <input
-                          type="text"
-                          className="border rounded px-2 py-1 w-full"
-                          value={draft.quality ?? ""}
-                          onChange={(e) => setDraft((d) => ({ ...d, quality: e.target.value }))}
-                        />
-                      ) : (
-                        s.quality ?? "—"
-                      )}
-                    </td>
-
-                    {/* Confidence */}
-                    <td className="p-2 border text-center">
-                      {isEditing ? (
-                        <input
-                          type="number"
-                          min={0}
-                          max={1}
-                          step="0.01"
-                          className="border rounded px-2 py-1 w-24 text-right"
-                          value={draft.confidence ?? ""}
-                          onChange={(e) =>
-                            setDraft((d) => ({ ...d, confidence: e.target.value === "" ? "" : Number(e.target.value) }))
-                          }
-                        />
-                      ) : s.confidence != null ? (
-                        Number(s.confidence).toFixed(2)
-                      ) : (
-                        "—"
-                      )}
-                    </td>
-
-                    {/* Notes */}
-                    <td className="p-2 border max-w-[20ch]" title={s.notes ?? ""}>
-                      {isEditing ? (
-                        <input
-                          type="text"
-                          className="border rounded px-2 py-1 w-full"
-                          value={draft.notes ?? ""}
-                          onChange={(e) => setDraft((d) => ({ ...d, notes: e.target.value }))}
-                        />
-                      ) : (
-                        <span className="truncate inline-block max-w-[20ch]">{s.notes ?? "—"}</span>
-                      )}
-                    </td>
-
-                    {/* Actions */}
-                    <td className="p-2 border space-x-2 whitespace-nowrap">
-                      {isEditing ? (
-                        <>
-                          <button
-                            type="button"
-                            className="border px-2 py-0.5 rounded hover:bg-slate-50"
-                            onClick={() => saveEdit(s.id)}
-                            disabled={savingEdit}
+                      <td className="p-2 border font-mono">{s.startS.toFixed(2)}</td>
+                      <td className="p-2 border font-mono">{s.endS.toFixed(2)}</td>
+                      <td className="p-2 border">
+                        {isEditing ? (
+                          <select
+                            className="border rounded px-2 py-1 w-full"
+                            value={draft.labelId ?? s.labelId}
+                            onChange={(e) => setDraft((d) => ({ ...d, labelId: e.target.value }))}
                           >
-                            {savingEdit ? "Saving…" : "Save"}
-                          </button>
-                          <button
-                            type="button"
-                            className="border px-2 py-0.5 rounded hover:bg-slate-50"
-                            onClick={cancelEdit}
-                            disabled={savingEdit}
+                            {labels.map((l) => (
+                              <option key={l.id} value={l.id}>
+                                {l.name}
+                              </option>
+                            ))}
+                          </select>
+                        ) : (
+                          <span
+                            className="px-2 py-0.5 rounded"
+                            style={{ background: s.label?.color ?? "rgba(34,197,94,0.25)" }}
                           >
-                            Cancel
-                          </button>
-                        </>
-                      ) : (
-                        <>
-                          <button
-                            type="button"
-                            className="border px-2 py-0.5 rounded hover:bg-slate-50"
-                            onClick={() => focusRegion(s.id, true)}
-                          >
-                            Go
-                          </button>
-                          <button
-                            type="button"
-                            className="border px-2 py-0.5 rounded hover:bg-slate-50"
-                            onClick={() => startEdit(s)}
-                          >
-                            Edit
-                          </button>
-                          <button
-                            type="button"
-                            className="border px-2 py-0.5 rounded text-red-600 hover:bg-red-50"
-                            onClick={() => handleDelete(s.id)}
-                          >
-                            Delete
-                          </button>
-                        </>
-                      )}
-                    </td>
-                  </tr>
-                );
-              })}
-          </tbody>
+                            {s.label?.name ?? s.labelId}
+                          </span>
+                        )}
+                      </td>
+                      <td className="p-2 border">
+                        {s.updatedBy?.name ||
+                          s.updatedBy?.email ||
+                          s.createdBy?.name ||
+                          s.createdBy?.email ||
+                          "—"}
+                      </td>
 
+                      <td className="p-2 border text-center">
+                        {isEditing ? (
+                          <input
+                            type="number"
+                            min={0}
+                            className="border rounded px-2 py-1 w-20 text-right"
+                            value={draft.individuals ?? ""}
+                            onChange={(e) =>
+                              setDraft((d) => ({
+                                ...d,
+                                individuals: e.target.value === "" ? "" : Number(e.target.value),
+                              }))
+                            }
+                          />
+                        ) : (
+                          s.individuals ?? "—"
+                        )}
+                      </td>
 
+                      <td className="p-2 border text-center">
+                        {isEditing ? (
+                          <input
+                            type="number"
+                            min={0}
+                            step="0.1"
+                            className="border rounded px-2 py-1 w-24 text-right"
+                            value={draft.callingRate ?? ""}
+                            onChange={(e) =>
+                              setDraft((d) => ({
+                                ...d,
+                                callingRate:
+                                  e.target.value === "" ? "" : Number(e.target.value),
+                              }))
+                            }
+                          />
+                        ) : s.callingRate != null ? (
+                          Number(s.callingRate).toFixed(2)
+                        ) : (
+                          "—"
+                        )}
+                      </td>
+
+                      <td className="p-2 border">
+                        {isEditing ? (
+                          <input
+                            type="text"
+                            className="border rounded px-2 py-1 w-full"
+                            value={draft.quality ?? ""}
+                            onChange={(e) => setDraft((d) => ({ ...d, quality: e.target.value }))}
+                          />
+                        ) : (
+                          s.quality ?? "—"
+                        )}
+                      </td>
+
+                      <td className="p-2 border text-center">
+                        {isEditing ? (
+                          <input
+                            type="number"
+                            min={0}
+                            max={1}
+                            step="0.01"
+                            className="border rounded px-2 py-1 w-24 text-right"
+                            value={draft.confidence ?? ""}
+                            onChange={(e) =>
+                              setDraft((d) => ({
+                                ...d,
+                                confidence:
+                                  e.target.value === "" ? "" : Number(e.target.value),
+                              }))
+                            }
+                          />
+                        ) : s.confidence != null ? (
+                          Number(s.confidence).toFixed(2)
+                        ) : (
+                          "—"
+                        )}
+                      </td>
+
+                      <td className="p-2 border max-w-[20ch]" title={s.notes ?? ""}>
+                        {isEditing ? (
+                          <input
+                            type="text"
+                            className="border rounded px-2 py-1 w-full"
+                            value={draft.notes ?? ""}
+                            onChange={(e) => setDraft((d) => ({ ...d, notes: e.target.value }))}
+                          />
+                        ) : (
+                          <span className="truncate inline-block max-w-[20ch]">
+                            {s.notes ?? "—"}
+                          </span>
+                        )}
+                      </td>
+
+                      <td className="p-2 border space-x-2 whitespace-nowrap">
+                        {isEditing ? (
+                          <>
+                            <button
+                              type="button"
+                              className="border px-2 py-0.5 rounded hover:bg-slate-50"
+                              onClick={() => saveEdit(s.id)}
+                              disabled={savingEdit}
+                            >
+                              {savingEdit ? "Saving…" : "Save"}
+                            </button>
+                            <button
+                              type="button"
+                              className="border px-2 py-0.5 rounded hover:bg-slate-50"
+                              onClick={cancelEdit}
+                              disabled={savingEdit}
+                            >
+                              Cancel
+                            </button>
+                          </>
+                        ) : (
+                          <>
+                            <button
+                              type="button"
+                              className="border px-2 py-0.5 rounded hover:bg-slate-50"
+                              onClick={() => focusRegion(s.id, true)}
+                            >
+                              Go
+                            </button>
+                            <button
+                              type="button"
+                              className="border px-2 py-0.5 rounded hover:bg-slate-50"
+                              onClick={() => startEdit(s)}
+                            >
+                              Edit
+                            </button>
+                            <button
+                              type="button"
+                              className="border px-2 py-0.5 rounded text-red-600 hover:bg-red-50"
+                              onClick={() => handleDelete(s.id)}
+                            >
+                              Delete
+                            </button>
+                          </>
+                        )}
+                      </td>
+                    </tr>
+                  );
+                })}
+            </tbody>
           </table>
         )}
       </div>
@@ -984,27 +1160,4 @@ useEffect(() => {
       </div>
     </div>
   );
-}
-
-function chipEl(text: string, bg: string) {
-  const el = document.createElement("span");
-  el.textContent = text;
-  el.style.padding = "2px 6px";
-  el.style.borderRadius = "6px";
-  el.style.background = bg;
-  el.style.color = "#000";
-  el.style.fontSize = "12px";
-  el.style.lineHeight = "16px";
-  el.style.userSelect = "none";
-  el.style.pointerEvents = "none";
-  return el;
-}
-
-function baseToRgba(hex: string, alpha: number) {
-  const shorthand = /^#?([a-f\d])([a-f\d])([a-f\d])$/i;
-  const full = hex.replace(shorthand, (_, r, g, b) => r + r + g + g + b + b);
-  const match = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(full);
-  if (!match) return hex;
-  const [, r, g, b] = match;
-  return `rgba(${parseInt(r, 16)}, ${parseInt(g, 16)}, ${parseInt(b, 16)}, ${alpha})`;
 }

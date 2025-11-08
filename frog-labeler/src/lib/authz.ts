@@ -36,12 +36,24 @@ export async function requireSiteAdmin(userId?: string) {
 
 /** Project helpers */
 export async function getUserProjectIds(userId: string) {
+  const user = await db.user.findUnique({
+    where: { id: userId },
+    select: { role: true },
+  });
+
+  if (user?.role === "admin") {
+    // global admins see all projects
+    const projects = await db.project.findMany({ select: { id: true } });
+    return projects.map((p) => p.id);
+  }
+
   const mems = await db.projectMembership.findMany({
     where: { userId },
     select: { projectId: true },
   });
   return mems.map((m) => m.projectId);
 }
+
 
 export async function getProjectRole(userId: string, projectId: string) {
   const m = await db.projectMembership.findUnique({
