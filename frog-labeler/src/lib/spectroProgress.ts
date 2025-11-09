@@ -13,34 +13,28 @@ export type FolderProgress = {
 const DATA_DIR = path.resolve(process.cwd(), ".spectro-cache");
 const CACHE_FILE = path.join(DATA_DIR, "progress.json");
 
-// In-memory progress cache (mirrors progress.json)
 let cache: Record<string, FolderProgress> = {};
 
-// --- helpers ---------------------------------------------------------------
-
-function loadCache() {
+// --- load/save helpers ----------------------------------------------------
+export function loadCache() {
   try {
     if (existsSync(CACHE_FILE)) {
       cache = JSON.parse(readFileSync(CACHE_FILE, "utf8"));
-      console.log(`📁 Loaded progress cache from ${CACHE_FILE}`);
+    } else {
+      mkdirSync(DATA_DIR, { recursive: true });
+      cache = {};
     }
-  } catch (err) {
-    console.warn("⚠️ Failed to load progress cache:", err);
+  } catch {
     cache = {};
   }
 }
 
-function saveCache() {
-  try {
-    mkdirSync(DATA_DIR, { recursive: true });
-    writeFileSync(CACHE_FILE, JSON.stringify(cache, null, 2));
-  } catch (err) {
-    console.error("⚠️ Failed to save progress cache:", err);
-  }
+export function saveCache() {
+  mkdirSync(DATA_DIR, { recursive: true });
+  writeFileSync(CACHE_FILE, JSON.stringify(cache, null, 2));
 }
 
-// --- core functions --------------------------------------------------------
-
+// --- public API ------------------------------------------------------------
 export function getProgress(folder: string): FolderProgress {
   if (!cache[folder]) {
     cache[folder] = {
@@ -55,6 +49,25 @@ export function getProgress(folder: string): FolderProgress {
   return cache[folder];
 }
 
+export function updateProgress(
+  folder: string,
+  update: Partial<FolderProgress>
+) {
+  const prev = getProgress(folder);
+  const next = { ...prev, ...update };
+  cache[folder] = next;
+  saveCache();
+}
+
+export function markFileDone(folder: string, file: string) {
+  const p = getProgress(folder);
+  if (!p.processedFiles.includes(file)) {
+    p.done += 1;
+    p.processedFiles.push(file);
+    updateProgress(folder, p);
+  }
+}
+
 export function initFolder(folder: string, total: number) {
   cache[folder] = {
     total,
@@ -67,47 +80,20 @@ export function initFolder(folder: string, total: number) {
   saveCache();
 }
 
-/**
- * ✅ Update progress safely for any field (done, errors, finished, etc.)
- * This is what your batch process calls repeatedly.
- */
-export function updateProgress(
-  folder: string,
-  update: Partial<FolderProgress>
-) {
-  const p = getProgress(folder);
-  Object.assign(p, update);
-  cache[folder] = p;
-  saveCache();
-}
-
 export function finishFolder(folder: string) {
   const p = getProgress(folder);
   p.finished = true;
-  cache[folder] = p;
-  saveCache();
-}
-
-export function markFileDone(folder: string, filePath: string) {
-  const p = getProgress(folder);
-  if (!p.processedFiles.includes(filePath)) {
-    p.processedFiles.push(filePath);
-    p.done += 1;
-    cache[folder] = p;
-    saveCache();
-  }
+  updateProgress(folder, p);
 }
 
 export function allProgress() {
   return cache;
 }
 
-/** Optionally reset all progress (used for testing/debug) */
 export function clearProgress() {
   cache = {};
   saveCache();
-  console.log("🧹 Cleared spectrogram progress cache");
 }
 
-// Load cache immediately when this module is imported
+// load once at startup
 loadCache();

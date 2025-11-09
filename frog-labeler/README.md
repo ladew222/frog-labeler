@@ -257,6 +257,10 @@ sudo systemctl stop frog-labeler
 cd /opt/apps/frog-labeler/frog-labeler
 git stash # if needed
 git pull
+or  to keep config:
+git update-index --skip-worktree next.config.ts
+git pull 
+
 ```
 
 4. Load env vars:
@@ -278,10 +282,7 @@ pnpm build
 6. Restart the service:
 
 ```bash
-
-
-
-
+sudo systemctl restart frog-labeler
 ```
 
 7. Check logs:
