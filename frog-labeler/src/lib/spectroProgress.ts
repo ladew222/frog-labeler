@@ -7,64 +7,72 @@ export type FolderProgress = {
   started: boolean;
   finished: boolean;
   errors: number;
+  processedFiles: Set<string>;
 };
 
-// --- where progress is stored on disk ---
 const DATA_DIR = path.resolve(process.cwd(), ".spectro-cache");
 const CACHE_FILE = path.join(DATA_DIR, "progress.json");
 
-// --- in-memory cache (auto loaded/saved) ---
-let cache: Record<string, FolderProgress> = {};
+let cache: Record<string, Omit<FolderProgress, "processedFiles"> & { processedFiles: string[] }> = {};
 
-// --- load from disk at startup ---
 function loadCache() {
   try {
     if (existsSync(CACHE_FILE)) {
-      const raw = readFileSync(CACHE_FILE, "utf8");
-      cache = JSON.parse(raw);
+      cache = JSON.parse(readFileSync(CACHE_FILE, "utf8"));
       console.log(`📁 Loaded progress cache from ${CACHE_FILE}`);
     }
-  } catch (err) {
-    console.warn("⚠️ Failed to load progress cache:", err);
+  } catch {
     cache = {};
   }
 }
 
-// --- save to disk ---
 function saveCache() {
-  try {
-    mkdirSync(DATA_DIR, { recursive: true });
-    writeFileSync(CACHE_FILE, JSON.stringify(cache, null, 2));
-  } catch (err) {
-    console.warn("⚠️ Failed to save progress cache:", err);
-  }
+  mkdirSync(DATA_DIR, { recursive: true });
+  writeFileSync(CACHE_FILE, JSON.stringify(cache, null, 2));
 }
 
-// --- public API ------------------------------------------------------------
-
-// update a folder’s progress
-export function updateProgress(folder: string, partial: Partial<FolderProgress>) {
-  const current = cache[folder] || {
+export function getProgress(folder: string) {
+  return cache[folder] || {
     total: 0,
     done: 0,
     started: false,
     finished: false,
     errors: 0,
+    processedFiles: [],
   };
-  cache[folder] = { ...current, ...partial };
+}
+
+export function markFileDone(folder: string, filePath: string) {
+  const p = getProgress(folder);
+  if (!p.processedFiles.includes(filePath)) {
+    p.done += 1;
+    p.processedFiles.push(filePath);
+    cache[folder] = p;
+    saveCache();
+  }
+}
+
+export function initFolder(folder: string, total: number) {
+  cache[folder] = {
+    total,
+    done: 0,
+    started: true,
+    finished: false,
+    errors: 0,
+    processedFiles: [],
+  };
   saveCache();
 }
 
-// return all progress data
-export function allProgress(): Record<string, FolderProgress> {
+export function finishFolder(folder: string) {
+  const p = getProgress(folder);
+  p.finished = true;
+  cache[folder] = p;
+  saveCache();
+}
+
+export function allProgress() {
   return cache;
 }
 
-// reset or clear (optional)
-export function clearProgress() {
-  cache = {};
-  saveCache();
-}
-
-// load once at startup
 loadCache();

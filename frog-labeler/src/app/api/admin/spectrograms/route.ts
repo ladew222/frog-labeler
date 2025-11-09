@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import { exec } from "child_process";
 import { readdirSync, statSync, mkdirSync, existsSync } from "fs";
 import path from "path";
-import { updateProgress } from "@/lib/spectroProgress";
+import { initFolder, markFileDone, finishFolder } from "@/lib/spectroProgress";
 
 const AUDIO_ROOT = process.env.AUDIO_ROOT || "/Volumes/frog/Data";
 const SPECTRO_ROOT = process.env.SPECTRO_ROOT || "/Volumes/frog/frog-spectrograms";
@@ -27,11 +27,10 @@ function findWavFiles(dir: string, acc: string[] = []): string[] {
 // --- concurrency-safe batch runner -----------------------------------------
 async function processBatch(folder: string, paths: string[], concurrency = 8) {
   let index = 0;
-  let done = 0;
   let errors = 0;
 
-  // Initialize progress for this folder
-  updateProgress(folder, { total: paths.length, done: 0, started: true, finished: false, errors: 0 });
+  // Initialize progress tracker
+  initFolder(folder, paths.length);
 
   async function worker() {
     while (index < paths.length) {
@@ -42,10 +41,9 @@ async function processBatch(folder: string, paths: string[], concurrency = 8) {
       mkdirSync(path.dirname(outPng), { recursive: true });
 
       try {
-        // skip existing
+        // Skip if PNG already exists
         if (existsSync(outPng)) {
-          done++;
-          updateProgress(folder, { done });
+          markFileDone(folder, rel);
           continue;
         }
 
@@ -57,26 +55,24 @@ async function processBatch(folder: string, paths: string[], concurrency = 8) {
               errors++;
             } else {
               console.log(`🛠 Generated: ${rel}`);
+              markFileDone(folder, rel);
             }
-            done++;
-            updateProgress(folder, { done, errors });
             resolve();
           });
         });
       } catch (err: any) {
         console.error(`❌ Exception: ${wavPath}`, err);
         errors++;
-        done++;
-        updateProgress(folder, { done, errors });
       }
     }
   }
 
+  // Run a limited number of concurrent workers
   const workers = Array.from({ length: concurrency }, () => worker());
   await Promise.allSettled(workers);
 
-  updateProgress(folder, { finished: true });
-  console.log(`✅ Completed batch for ${folder}`);
+  finishFolder(folder);
+  console.log(`✅ Completed batch for ${folder} with ${errors} errors`);
 }
 
 // --- route handler ----------------------------------------------------------
@@ -84,7 +80,8 @@ export async function POST(req: Request) {
   try {
     const body = await req.json().catch(() => ({}));
     const folder = body.folder;
-    if (!folder) return NextResponse.json({ error: "Missing folder" }, { status: 400 });
+    if (!folder)
+      return NextResponse.json({ error: "Missing folder" }, { status: 400 });
 
     const absFolder = safeJoin(AUDIO_ROOT, folder);
     const wavs = findWavFiles(absFolder);
@@ -94,10 +91,13 @@ export async function POST(req: Request) {
 
     console.log(`🟢 Starting batch generation for ${folder} (${wavs.length} files)`);
 
-    // run async (don’t block API response)
+    // Run in background without blocking the API response
     processBatch(folder, wavs, 8);
 
-    return NextResponse.json({ message: `Started batch generation for ${folder}`, total: wavs.length });
+    return NextResponse.json({
+      message: `Started batch generation for ${folder}`,
+      total: wavs.length,
+    });
   } catch (err: any) {
     console.error("❌ Spectrogram background error:", err);
     return NextResponse.json({ error: err.message }, { status: 500 });
