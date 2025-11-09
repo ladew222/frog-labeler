@@ -20,6 +20,7 @@ export default function SpectrogramBatchAdmin() {
   const [selected, setSelected] = useState<string[]>([]);
   const [progress, setProgress] = useState<ProgressInfo>({});
   const [busy, setBusy] = useState(false);
+  const [clearing, setClearing] = useState(false);
 
   /** ---------------- Fetch folder list ---------------- */
   useEffect(() => {
@@ -48,13 +49,15 @@ export default function SpectrogramBatchAdmin() {
   async function runBatch() {
     setBusy(true);
     try {
-      const res = await fetch("/api/admin/spectrograms", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ folders: selected }),
-      });
-      const data = await res.json();
-      console.log("Batch started:", data);
+      for (const folder of selected) {
+        const res = await fetch("/api/admin/spectrograms", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ folder }),
+        });
+        const data = await res.json();
+        console.log("Batch started:", data);
+      }
     } catch (err) {
       console.error("Batch error:", err);
     } finally {
@@ -62,7 +65,21 @@ export default function SpectrogramBatchAdmin() {
     }
   }
 
-  /** ---------------- Toggle folder selection ---------------- */
+  /** ---------------- Clear all progress ---------------- */
+  async function clearAllProgress() {
+    setClearing(true);
+    try {
+      await fetch("/api/admin/spectrograms/clear", { method: "POST" });
+      setProgress({});
+      console.log("🧹 Progress cache cleared");
+    } catch (err) {
+      console.error("Clear progress failed:", err);
+    } finally {
+      setClearing(false);
+    }
+  }
+
+  /** ---------------- Helpers ---------------- */
   function toggle(folder: string) {
     setSelected((prev) =>
       prev.includes(folder)
@@ -71,10 +88,24 @@ export default function SpectrogramBatchAdmin() {
     );
   }
 
+  function getStatus(): string {
+    const active = Object.values(progress).some((p) => p.started && !p.finished);
+    const anyDone = Object.values(progress).some((p) => p.finished);
+    if (active) return "🟢 Running";
+    if (anyDone) return "✅ Done";
+    return "🟡 Idle";
+  }
+
   /** ---------------- Render ---------------- */
   return (
     <div className="space-y-4 p-6">
-      <h1 className="text-xl font-semibold">Spectrogram Batch Generator</h1>
+      <div className="flex items-center justify-between">
+        <h1 className="text-xl font-semibold">Spectrogram Batch Generator</h1>
+        <span className="text-sm text-slate-600 bg-slate-100 px-2 py-1 rounded">
+          Status: {getStatus()}
+        </span>
+      </div>
+
       <p className="text-slate-600 text-sm">
         Select one or more audio folders to pre-generate spectrograms in the background.
       </p>
@@ -118,13 +149,23 @@ export default function SpectrogramBatchAdmin() {
         })}
       </div>
 
-      <button
-        onClick={runBatch}
-        disabled={busy || selected.length === 0}
-        className="border rounded px-3 py-1 bg-emerald-600 text-white disabled:opacity-50"
-      >
-        {busy ? "Starting..." : "Generate Spectrograms"}
-      </button>
+      <div className="flex items-center gap-3">
+        <button
+          onClick={runBatch}
+          disabled={busy || selected.length === 0}
+          className="border rounded px-3 py-1 bg-emerald-600 text-white disabled:opacity-50"
+        >
+          {busy ? "Starting..." : "Generate Spectrograms"}
+        </button>
+
+        <button
+          onClick={clearAllProgress}
+          disabled={clearing}
+          className="border rounded px-3 py-1 bg-slate-600 text-white disabled:opacity-50"
+        >
+          {clearing ? "Clearing..." : "🧹 Clear Progress"}
+        </button>
+      </div>
     </div>
   );
 }
