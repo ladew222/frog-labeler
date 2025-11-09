@@ -1,0 +1,105 @@
+import { NextResponse } from "next/server";
+import { exec } from "child_process";
+import { readdirSync, statSync, mkdirSync, existsSync } from "fs";
+import path from "path";
+import { updateProgress } from "@/lib/spectroProgress";
+
+const AUDIO_ROOT = process.env.AUDIO_ROOT || "/Volumes/frog/Data";
+const SPECTRO_ROOT = process.env.SPECTRO_ROOT || "/Volumes/frog/frog-spectrograms";
+
+// --- helpers ---------------------------------------------------------------
+function safeJoin(root: string, rel: string) {
+  const p = path.normalize(path.join(root, rel));
+  if (!p.startsWith(path.normalize(root))) throw new Error("Invalid path");
+  return p;
+}
+
+function findWavFiles(dir: string, acc: string[] = []): string[] {
+  for (const f of readdirSync(dir)) {
+    const p = path.join(dir, f);
+    const s = statSync(p);
+    if (s.isDirectory()) findWavFiles(p, acc);
+    else if (f.toLowerCase().endsWith(".wav")) acc.push(p);
+  }
+  return acc;
+}
+
+// --- concurrency-safe batch runner -----------------------------------------
+async function processBatch(folder: string, paths: string[], concurrency = 8) {
+  let index = 0;
+  let done = 0;
+  let errors = 0;
+
+  // Initialize progress for this folder
+  updateProgress(folder, { total: paths.length, done: 0, started: true, finished: false, errors: 0 });
+
+  async function worker() {
+    while (index < paths.length) {
+      const i = index++;
+      const wavPath = paths[i];
+      const rel = path.relative(AUDIO_ROOT, wavPath);
+      const outPng = safeJoin(SPECTRO_ROOT, rel + ".png");
+      mkdirSync(path.dirname(outPng), { recursive: true });
+
+      try {
+        // skip existing
+        if (existsSync(outPng)) {
+          done++;
+          updateProgress(folder, { done });
+          continue;
+        }
+
+        const cmd = `ffmpeg -y -hide_banner -loglevel error -i "${wavPath}" -lavfi "showspectrumpic=s=1920x480:legend=disabled:color=intensity:scale=log" "${outPng}"`;
+        await new Promise<void>((resolve) => {
+          exec(cmd, (err) => {
+            if (err) {
+              console.error(`❌ Failed: ${rel} (${err.message})`);
+              errors++;
+            } else {
+              console.log(`🛠 Generated: ${rel}`);
+            }
+            done++;
+            updateProgress(folder, { done, errors });
+            resolve();
+          });
+        });
+      } catch (err: any) {
+        console.error(`❌ Exception: ${wavPath}`, err);
+        errors++;
+        done++;
+        updateProgress(folder, { done, errors });
+      }
+    }
+  }
+
+  const workers = Array.from({ length: concurrency }, () => worker());
+  await Promise.allSettled(workers);
+
+  updateProgress(folder, { finished: true });
+  console.log(`✅ Completed batch for ${folder}`);
+}
+
+// --- route handler ----------------------------------------------------------
+export async function POST(req: Request) {
+  try {
+    const body = await req.json().catch(() => ({}));
+    const folder = body.folder;
+    if (!folder) return NextResponse.json({ error: "Missing folder" }, { status: 400 });
+
+    const absFolder = safeJoin(AUDIO_ROOT, folder);
+    const wavs = findWavFiles(absFolder);
+    if (wavs.length === 0) {
+      return NextResponse.json({ logs: [`No .wav files in ${absFolder}`] });
+    }
+
+    console.log(`🟢 Starting batch generation for ${folder} (${wavs.length} files)`);
+
+    // run async (don’t block API response)
+    processBatch(folder, wavs, 8);
+
+    return NextResponse.json({ message: `Started batch generation for ${folder}`, total: wavs.length });
+  } catch (err: any) {
+    console.error("❌ Spectrogram background error:", err);
+    return NextResponse.json({ error: err.message }, { status: 500 });
+  }
+}

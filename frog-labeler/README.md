@@ -278,7 +278,8 @@ pnpm build
 6. Restart the service:
 
 ```bash
-sudo systemctl restart frog-labeler
+
+
 ```
 
 7. Check logs:
