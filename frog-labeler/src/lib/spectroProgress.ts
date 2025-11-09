@@ -1,4 +1,4 @@
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
+import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync } from "fs";
 import path from "path";
 
 export type FolderProgress = {
@@ -7,13 +7,15 @@ export type FolderProgress = {
   started: boolean;
   finished: boolean;
   errors: number;
-  processedFiles: Set<string>;
+  processedFiles: string[];
 };
 
 const DATA_DIR = path.resolve(process.cwd(), ".spectro-cache");
 const CACHE_FILE = path.join(DATA_DIR, "progress.json");
 
-let cache: Record<string, Omit<FolderProgress, "processedFiles"> & { processedFiles: string[] }> = {};
+let cache: Record<string, FolderProgress> = {};
+
+// --- Load / Save helpers ---------------------------------------------------
 
 function loadCache() {
   try {
@@ -31,15 +33,22 @@ function saveCache() {
   writeFileSync(CACHE_FILE, JSON.stringify(cache, null, 2));
 }
 
+// Load cache immediately on module import
+loadCache();
+
+// --- API functions ---------------------------------------------------------
+
 export function getProgress(folder: string) {
-  return cache[folder] || {
-    total: 0,
-    done: 0,
-    started: false,
-    finished: false,
-    errors: 0,
-    processedFiles: [],
-  };
+  return (
+    cache[folder] || {
+      total: 0,
+      done: 0,
+      started: false,
+      finished: false,
+      errors: 0,
+      processedFiles: [],
+    }
+  );
 }
 
 export function markFileDone(folder: string, filePath: string) {
@@ -75,4 +84,15 @@ export function allProgress() {
   return cache;
 }
 
-loadCache();
+// Optional utility to clear the cache completely
+export function clearProgress() {
+  try {
+    if (existsSync(CACHE_FILE)) {
+      unlinkSync(CACHE_FILE);
+      console.log("🧹 Cleared spectrogram progress cache");
+    }
+    cache = {};
+  } catch (err) {
+    console.error("❌ Failed to clear cache:", err);
+  }
+}
