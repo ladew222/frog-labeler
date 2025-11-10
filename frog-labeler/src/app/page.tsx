@@ -39,6 +39,7 @@ type SP = {
   to?: string;     // ← NEW (YYYY-MM-DD)
   mdFrom?: string;   // e.g. "03-01"
   mdTo?: string;     // e.g. "05-31"
+  notSilent?: string;
 };
 
 function timeAgo(date: Date): string {
@@ -200,6 +201,8 @@ export default async function Home({
   const q = (sp.q ?? "").trim();
   const siteParam   = (sp.site ?? "").trim();
   const folderParam = (sp.folder ?? "").trim();
+  const notSilentParam = sp.notSilent === "true";
+
 
   // date inputs
   const fromParam   = (sp.from ?? "").trim();   // YYYY-MM-DD
@@ -235,6 +238,11 @@ export default async function Home({
     folderParam
       ? { uri: { startsWith: `/audio/${encodeURIComponent(folderParam)}/` } }
       : undefined;
+
+  const notSilentFilter: Prisma.AudioFileWhereInput | undefined = notSilentParam
+  ? { likelySound: { gt: 5 } } // adjust threshold as you like
+  : undefined;
+
 
   // Base where WITHOUT any date restriction (to discover min/max year in scope)
   const baseWhere: Prisma.AudioFileWhereInput | undefined = (() => {
@@ -299,6 +307,7 @@ export default async function Home({
     siteFilter,
     folderFilter,
     dateWhere,
+    notSilentFilter, 
   ].filter(Boolean) as Prisma.AudioFileWhereInput[];
 
 const where: Prisma.AudioFileWhereInput | undefined =
@@ -389,6 +398,7 @@ const files = filesRaw.map((f) => {
       to:     over.to     ?? toParam,
       mdFrom: over.mdFrom ?? mdFromParam,
       mdTo:   over.mdTo   ?? mdToParam,
+      notSilent: String(over.notSilent ?? notSilentParam),
     });
     return `/?${s.toString()}`;
   };
@@ -548,7 +558,15 @@ const files = filesRaw.map((f) => {
             <option value="100">100</option>
           </select>
         </label>
-
+        <label className="text-sm flex items-center gap-1 mt-2">
+          <input
+            type="checkbox"
+            name="notSilent"
+            value="true"
+            defaultChecked={notSilentParam}
+          />
+          <span className="text-slate-700">Not silent only</span>
+        </label>
         <input type="hidden" name="page" value="1" />
         <button type="submit" className="border rounded px-3 h-8 inline-flex items-center">
           Apply
