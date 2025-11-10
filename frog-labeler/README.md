@@ -260,7 +260,6 @@ git pull
 or  to keep config:
 git update-index --skip-worktree next.config.ts
 
-
 ```
 
 4. Load env vars:

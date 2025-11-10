@@ -17,11 +17,15 @@ function getAllStatsFiles(dir: string): string[] {
   const files: string[] = [];
   for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
     const full = path.join(dir, entry.name);
-    if (entry.isDirectory()) files.push(...getAllStatsFiles(full));
-    else if (entry.isFile() && entry.endsWith(".stats.json")) files.push(full);
+    if (entry.isDirectory()) {
+      files.push(...getAllStatsFiles(full));
+    } else if (entry.isFile() && entry.name.endsWith(".stats.json")) {
+      files.push(full);
+    }
   }
   return files;
 }
+
 
 (async () => {
   if (!fs.existsSync(CACHE_DIR)) {
