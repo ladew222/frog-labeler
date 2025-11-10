@@ -64,15 +64,22 @@ model AudioFile {
   site           String?
   unitId         String?
   extension      String?
-  sequence       Int? // optional — used if filenames include _NN
+  sequence       Int?
   createdAt      DateTime  @default(now())
   segments       Segment[]
   lastModifiedAt DateTime  @default(now())
 
-  @@unique([projectId, originalName]) // filenames unique per project
+  // --- NEW FIELDS ---
+  likelySound    Float?     // percentage such as 18.6
+  lastScannedAt  DateTime?  // when detection last ran
+  // -------------------
+
+  @@unique([projectId, originalName])
   @@index([projectId])
   @@index([recordedAt])
+  @@index([likelySound])     // speeds up “not silent” queries
 }
+
 
 model Label {
   id        String  @id @default(cuid())

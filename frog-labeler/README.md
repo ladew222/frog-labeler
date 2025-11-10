@@ -276,7 +276,9 @@ set +a
 ```bash
 pnpm install --frozen-lockfile
 pnpm dlx prisma generate
-pnpm build
+
+
+
 ```
 
 6. Restart the service:
