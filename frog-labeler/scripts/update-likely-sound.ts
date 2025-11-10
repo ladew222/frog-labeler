@@ -3,39 +3,24 @@ import { db } from "@/lib/db";
 import fs from "fs";
 import path from "path";
 
-/**
- * This script updates AudioFile.likelySound and lastScannedAt
- * based on nightly detection output (JSON or CSV).
- * Run via:  pnpm tsx scripts/update-likely-sound.ts
- */
-
-const RESULTS_PATH =
-  process.env.SOUND_RESULTS_PATH || "/Volumes/frog/nightly_sound.json";
+const CACHE_DIR = process.env.CACHE_DIR || "/var/cache/frog-peaks";
 
 (async () => {
-  if (!fs.existsSync(RESULTS_PATH)) {
-    console.error(`❌ Results file not found: ${RESULTS_PATH}`);
-    process.exit(1);
-  }
-
-  // Example: [{ filename: "INDU04_20150401_230000.wav", score: 0.186 }]
-  const data = JSON.parse(fs.readFileSync(RESULTS_PATH, "utf8"));
+  const files = fs.readdirSync(CACHE_DIR, { recursive: true })
+    .filter(f => f.endsWith(".stats.json"))
+    .map(f => path.join(CACHE_DIR, f));
 
   let updated = 0;
-  for (const { filename, score } of data) {
-    const percent =
-      typeof score === "number"
-        ? score * 100
-        : parseFloat(score.toString()) || null;
+
+  for (const file of files) {
+    const json = JSON.parse(fs.readFileSync(file, "utf8"));
+    const filename = path.basename(file).replace(".stats.json", ".wav");
+    const score = json.likelySound ?? json.rms ?? null;
 
     await db.audioFile.updateMany({
       where: { originalName: filename },
-      data: {
-        likelySound: percent,
-        lastScannedAt: new Date(),
-      },
+      data: { likelySound: score ? score * 100 : null, lastScannedAt: new Date() },
     });
-
     updated++;
   }
 

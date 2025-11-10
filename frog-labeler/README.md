@@ -259,7 +259,7 @@ git stash # if needed
 git pull
 or  to keep config:
 git update-index --skip-worktree next.config.ts
-git pull 
+
 
 ```
 
@@ -276,15 +276,16 @@ set +a
 ```bash
 pnpm install --frozen-lockfile
 pnpm dlx prisma generate
-
-
-
+pnpm build
 ```
 
 6. Restart the service:
 
 ```bash
-sudo systemctl restart frog-labeler
+
+
+
+
 ```
 
 7. Check logs:
