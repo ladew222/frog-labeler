@@ -127,10 +127,41 @@ const overlayCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const [dragPxEnd, setDragPxEnd] = useState<number | null>(null);
 
   const [zoom, setZoom] = useState(1);
+  const [displayWidth, setDisplayWidth] = useState<number>(0);
+  // 👇 Add this line
+  const [timeOffset, setTimeOffset] = useState(.25);
+
   // ... rest of your state unchanged ...
   useEffect(() => {
   console.log("🔍 Zoom changed →", zoom);
 }, [zoom]);
+useEffect(() => {
+  console.log("🎚️ Current time offset:", timeOffset);
+}, [timeOffset]);
+
+
+useEffect(() => {
+  if (!displayWidth || !duration) return;
+  console.log(`🧮 displayWidth=${displayWidth}px → ${displayPxPerSecond.toFixed(2)} px/sec`);
+}, [displayWidth, duration]);
+
+
+
+useEffect(() => {
+  const container = containerRef.current;
+  if (!container) return;
+
+  const observer = new ResizeObserver(entries => {
+    for (const entry of entries) {
+      setDisplayWidth(entry.contentRect.width);
+    }
+  });
+  observer.observe(container);
+
+  // Cleanup on unmount
+  return () => observer.disconnect();
+}, []);
+
 
 
 
@@ -253,6 +284,24 @@ const secondsPerPixel = duration / naturalWidth;
 const timeToX = (t: number) => t / secondsPerPixel;
 const xToTime = (x: number) => x * secondsPerPixel;
 
+// Map from seconds → display pixels (on-screen)
+const displayPxPerSecond = duration > 0 && displayWidth > 0 ? displayWidth / duration : 0.0001;
+
+
+
+// Convert between time (seconds) and *actual displayed* pixels
+// Each pixel in the *displayed (zoomed)* image corresponds to this many seconds:
+function timeToDisplayX(t: number): number {
+  // convert seconds → pixel position in the zoomed image
+  return (t / duration) * (naturalWidth * zoom);
+}
+
+function displayXToTime(x: number): number {
+  // convert pixel position in the zoomed image → seconds
+  return (x / (naturalWidth * zoom)) * duration;
+}
+
+
 
 /** ---------- Canvas Drawing ---------- */
 
@@ -267,18 +316,27 @@ useEffect(() => {
   console.log("🖼️ Loading spectrogram:", spectrogramPath);
 
   const img = new Image();
-  img.onload = () => {
-    console.log("✅ Spectrogram loaded", {
-      width: img.naturalWidth,
-      height: img.naturalHeight,
-    });
-    setSpectrogramImage(img);
-  };
+ img.crossOrigin = "anonymous"; // handles local + deployed CORS
+img.onload = () => {
+  console.log("✅ Spectrogram loaded OK", img.src);
+  console.log("⏱ Audio duration:", duration, "s");
+  console.log("🖼 Spectrogram width:", img.naturalWidth, "px");
+  console.log("=> secondsPerPixel =", duration / img.naturalWidth);
+
+  setSpectrogramImage(img);
+};
+img.onerror = () => {
+  console.error("❌ Failed to load spectrogram image:", img.src);
+};
+
+img.crossOrigin = "anonymous"; // handles local + deployed CORS
+img.onload = () => {
+  console.log("✅ Spectrogram loaded OK", img.src);
+  setSpectrogramImage(img);
+};
+
+
   img.crossOrigin = "anonymous"; // handles local + deployed CORS
-  img.onload = () => {
-    console.log("✅ Spectrogram loaded OK", img.src);
-    setSpectrogramImage(img);
-  };
   img.onerror = () => {
     console.error("❌ Failed to load spectrogram image:", img.src);
   };
@@ -313,7 +371,92 @@ useEffect(() => {
   // (you’ll use this when converting time <-> x)
 }, [spectrogramImage]);
 
+// --- Draw playhead whenever currentTime changes ---
+// --- Smooth playhead drawing loop ---
+useEffect(() => {
+  const canvas = spectrogramCanvasRef.current;
+  const ctx = canvas?.getContext("2d");
+  const el = audioRef.current;
+  if (!canvas || !ctx || !spectrogramImage || !duration || !el) return;
 
+  const { naturalWidth, naturalHeight } = spectrogramImage;
+  const secondsPerPixel = duration / naturalWidth;
+  let frameId: number;
+
+  const draw = () => {
+    if (!ctx) return;
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.drawImage(spectrogramImage, 0, 0);
+
+    // ✅ Now includes updated offset
+    const x = (el.currentTime + timeOffset) / secondsPerPixel;
+
+    ctx.beginPath();
+    ctx.moveTo(x, 0);
+    ctx.lineTo(x, naturalHeight);
+    ctx.strokeStyle = "rgba(255,255,255,0.9)";
+    ctx.lineWidth = 2;
+    ctx.stroke();
+
+    frameId = requestAnimationFrame(draw);
+  };
+
+  const onPlay = () => {
+    frameId = requestAnimationFrame(draw);
+  };
+  const onPause = () => cancelAnimationFrame(frameId);
+
+  el.addEventListener("play", onPlay);
+  el.addEventListener("pause", onPause);
+  if (!el.paused) frameId = requestAnimationFrame(draw);
+
+  return () => {
+    el.removeEventListener("play", onPlay);
+    el.removeEventListener("pause", onPause);
+    cancelAnimationFrame(frameId);
+  };
+}, [spectrogramImage, duration, timeOffset]); // 👈 ADD timeOffset here
+
+
+
+// --- Auto-scroll as playhead moves ---
+// --- Auto-scroll as playhead moves (keep playhead at start of view) ---
+useEffect(() => {
+  const container = containerRef.current?.parentElement;
+  if (!container || !spectrogramImage || !duration) return;
+
+  const { naturalWidth } = spectrogramImage;
+  const pxPerSec = (naturalWidth * zoom) / duration;
+  const visibleWidth = container.clientWidth;
+
+  let frameId: number;
+
+  const updateScroll = () => {
+    const playheadX = (audioRef.current?.currentTime ?? 0) * pxPerSec;
+    const scrollLeft = container.scrollLeft;
+
+    // If playhead moves beyond the right edge → advance so it’s near left edge
+    if (playheadX > scrollLeft + visibleWidth - 50) {
+      container.scrollTo({
+        left: playheadX - 20,  // small padding before the playhead
+        behavior: "smooth",
+      });
+    }
+
+    // Optional: if user scrubs backward, bring playhead into view again
+    if (playheadX < scrollLeft + 20) {
+      container.scrollTo({
+        left: Math.max(0, playheadX - 20),
+        behavior: "smooth",
+      });
+    }
+
+    frameId = requestAnimationFrame(updateScroll);
+  };
+
+  frameId = requestAnimationFrame(updateScroll);
+  return () => cancelAnimationFrame(frameId);
+}, [spectrogramImage, zoom, duration]);
 
 
 
@@ -355,13 +498,18 @@ const onMouseUp = () => {
     setDragPxEnd(null);
     return;
   }
+// convert display pixels → time directly
+const startDisplay = Math.min(dragPxStart, dragPxEnd);
+const endDisplay   = Math.max(dragPxStart, dragPxEnd);
 
-  const startPx = Math.min(dragPxStart, dragPxEnd);
-  const endPx = Math.max(dragPxStart, dragPxEnd);
-  const tS = xToTime(startPx);
-  const tE = Math.max(tS + 0.02, xToTime(endPx));
+const tS = displayXToTime(startDisplay);
+const tE = Math.max(tS + 0.02, displayXToTime(endDisplay));
 
-  console.log("🖱️ MouseUp", { startPx, endPx, tS, tE });
+
+
+  console.log("🖱️ MouseUp", { tS, tE });
+
+
 
   setSelStart(tS);
   setSelEnd(Math.min(duration, tE));
@@ -606,6 +754,22 @@ const onMouseUp = () => {
   />
   <span>{zoom.toFixed(1)}×</span>
 </div>
+{/* Offset tuning control */}
+<div className="flex items-center gap-3 text-sm">
+  <label>Sync Offset:</label>
+  <input
+    type="range"
+    min={-4}
+    max={4}
+    step={0.01}
+    value={timeOffset}
+    onChange={(e) => setTimeOffset(parseFloat(e.target.value))}
+    className="w-64"
+  />
+  <span>{timeOffset.toFixed(2)} s</span>
+  <span className="text-slate-500 text-xs">(negative = earlier, positive = later)</span>
+</div>
+
 {/* === Canvas-based spectrogram === */}
 <div className="relative border rounded overflow-x-auto bg-black" style={{ height: "12rem" }}>
 <div
@@ -640,11 +804,12 @@ const onMouseUp = () => {
   <div
     className="absolute top-0 bottom-0 w-[2px] bg-red-500 pointer-events-none"
     style={{
-      left: `${debugClickX - (containerRef.current?.parentElement?.scrollLeft ?? 0)}px`,
+      left: `${timeToDisplayX(selStart) - (containerRef.current?.parentElement?.scrollLeft ?? 0)}px`,
       zIndex: 10,
     }}
   />
 )}
+
 
 
 
@@ -657,12 +822,13 @@ const onMouseUp = () => {
           data-seg-box={s.id}
           className="absolute top-0 bottom-0 border-x-2 pointer-events-none opacity-50"
           style={{
-            left: `${timeToX(s.startS) * zoom - (containerRef.current?.parentElement?.scrollLeft ?? 0)}px`,
+            left: `${timeToDisplayX(s.startS) - (containerRef.current?.parentElement?.scrollLeft ?? 0)}px`,
             width: `${(timeToX(s.endS) - timeToX(s.startS)) * zoom}px`,
             background: baseToRgba(color, 0.25),
             borderColor: color,
             zIndex: 3,
           }}
+
           title={`${s.label?.name ?? "Unknown"}: ${fmt(s.startS)}–${fmt(s.endS)}s`}
         />
       );
@@ -670,15 +836,15 @@ const onMouseUp = () => {
 
     {/* Selection overlay */}
     {duration > 0 && selEnd > selStart && dragPxStart == null && (
-      <div
-        className="absolute top-0 bottom-0 bg-green-500/25 border-x border-green-400 pointer-events-none"
-        style={{
-          left: `${timeToX(selStart) * zoom - (containerRef.current?.parentElement?.scrollLeft ?? 0)}px`,
-          width: `${(timeToX(selEnd) - timeToX(selStart)) * zoom}px`,
-          zIndex: 5,
-        }}
-      />
-    )}
+  <div
+    className="absolute top-0 bottom-0 bg-green-500/25 border-x border-green-400 pointer-events-none"
+    style={{
+      left: `${timeToDisplayX(selStart) - (containerRef.current?.parentElement?.scrollLeft ?? 0)}px`,
+      width: `${timeToDisplayX(selEnd) - timeToDisplayX(selStart)}px`,
+      zIndex: 5,
+    }}
+  />
+)}
 
 
     {/* Drag overlay */}
@@ -698,7 +864,7 @@ const onMouseUp = () => {
     <div
       className="absolute top-0 bottom-0 w-[2px] bg-white/80 pointer-events-none"
       style={{
-        left: `${timeToX(currentTime) * zoom - (containerRef.current?.parentElement?.scrollLeft ?? 0)}px`,
+        left: `${timeToDisplayX(selStart) - (containerRef.current?.parentElement?.scrollLeft ?? 0)}px`,
         zIndex: 7,
       }}
     />
