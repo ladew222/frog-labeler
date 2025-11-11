@@ -76,25 +76,20 @@ function screenToSpectroX(
 ): number {
   const inner = containerRef.current;
   if (!inner) return 0;
+
   const sc = inner.parentElement as HTMLElement;
   if (!sc) return 0;
 
   const rect = inner.getBoundingClientRect();
   const scrollLeft = sc.scrollLeft;
   const xDisplay = e.clientX - rect.left + scrollLeft;
-  const xIntrinsic = xDisplay / zoom;
 
-  console.log("🎯 Click mapping (layout-based)", {
-    clientX: e.clientX,
-    rectLeft: rect.left,
-    scrollLeft,
-    zoom,
-    xDisplay,
-    xIntrinsic,
-  });
+  // Convert to intrinsic coordinate space (unscaled image)
+  const xIntrinsic = xDisplay / zoom;
 
   return Math.max(0, xIntrinsic);
 }
+
 
 
 
@@ -493,28 +488,26 @@ const onMouseMove = (e: React.MouseEvent<HTMLDivElement>) => {
 
 const onMouseUp = () => {
   if (dragPxStart == null || dragPxEnd == null) {
-    console.warn("⚠️ MouseUp ignored — no drag active");
     setDragPxStart(null);
     setDragPxEnd(null);
     return;
   }
-// convert display pixels → time directly
-const startDisplay = Math.min(dragPxStart, dragPxEnd);
-const endDisplay   = Math.max(dragPxStart, dragPxEnd);
 
-const tS = displayXToTime(startDisplay);
-const tE = Math.max(tS + 0.02, displayXToTime(endDisplay));
+  // Convert from intrinsic pixels → seconds
+  const startIntrinsic = Math.min(dragPxStart, dragPxEnd);
+  const endIntrinsic = Math.max(dragPxStart, dragPxEnd);
 
+  const secondsPerPixel = duration / naturalWidth;
 
-
-  console.log("🖱️ MouseUp", { tS, tE });
-
-
+  const tS = startIntrinsic * secondsPerPixel;
+  const tE = Math.max(tS + 0.02, endIntrinsic * secondsPerPixel);
 
   setSelStart(tS);
   setSelEnd(Math.min(duration, tE));
   setDragPxStart(null);
   setDragPxEnd(null);
+
+  console.log("🖱️ Selection →", { startIntrinsic, endIntrinsic, tS, tE, zoom });
 };
 
 

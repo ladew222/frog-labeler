@@ -258,7 +258,8 @@ cd /opt/apps/frog-labeler/frog-labeler
 git stash # if needed
 git pull
 or  to keep config:
-git update-index --skip-worktree next.config.ts
+
+
 
 ```
 
