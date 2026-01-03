@@ -67,7 +67,7 @@ export async function GET(req: Request) {
       const cmd =
         `ffmpeg -y -hide_banner -loglevel error -i "${wavPath}" -lavfi ` +
         `"showspectrumpic=s=${finalWidth}x${height}:legend=disabled:color=gray:scale=log" ` +
-        `"${outPng}"`;
+        `"${outPng}"`
       console.log("🛠 ffmpeg:", cmd);
       execSync(cmd, { stdio: "inherit" });
     }
