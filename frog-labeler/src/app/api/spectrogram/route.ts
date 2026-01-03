@@ -68,12 +68,13 @@ export async function GET(req: Request) {
         `ffmpeg -y -hide_banner -loglevel error -i "${wavPath}" ` +
         `-lavfi "` +
         `highpass=f=120,` +
-        `showspectrum=s=1920x480:` +
-        `mode=combined:` +
+        `lowpass=f=4000,` +
+        `showspectrumpic=s=1920x480:` +
         `scale=log:` +
-        `drange=45:` +
-        `color=gray` +
-        `" -frames:v 1 "${outPng}"`;
+        `drange=45,` +
+        `format=gray` +
+        `" "${outPng}"`;
+
 
 
 

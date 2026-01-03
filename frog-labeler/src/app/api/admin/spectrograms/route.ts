@@ -50,12 +50,13 @@ async function processBatch(folder: string, paths: string[], concurrency = 8) {
           `ffmpeg -y -hide_banner -loglevel error -i "${wavPath}" ` +
           `-lavfi "` +
           `highpass=f=120,` +
-          `showspectrum=s=1920x480:` +
-          `mode=combined:` +
+          `lowpass=f=4000,` +
+          `showspectrumpic=s=1920x480:` +
           `scale=log:` +
-          `drange=45:` +
-          `color=gray` +
-          `" -frames:v 1 "${outPng}"`;
+          `drange=45,` +
+          `format=gray` +
+          `" "${outPng}"`;
+
 
 
         await new Promise<void>((resolve) => {
