@@ -48,9 +48,9 @@ async function processBatch(folder: string, paths: string[], concurrency = 8) {
         }
 
         const cmd =
-        `ffmpeg -y -hide_banner -loglevel error -i "${wavPath}" ` +
-        `-lavfi "showspectrumpic=s=1920x480:legend=disabled:scale=log" ` +
-        `"${outPng}"`;
+          `ffmpeg -y -hide_banner -loglevel error -i "${wavPath}" ` +
+          `-lavfi "showspectrumpic=s=1920x480:legend=disabled:scale=log:colors=gray" ` +
+          `"${outPng}"`;
         await new Promise<void>((resolve) => {
           exec(cmd, (err) => {
             if (err) {

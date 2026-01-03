@@ -65,9 +65,9 @@ export async function GET(req: Request) {
     // --- Generate only if missing or forced ---
     if (forceRegen || !existsSync(outPng)) {
       const cmd =
-        `ffmpeg -y -hide_banner -loglevel error -i "${wavPath}" -lavfi ` +
-        `"showspectrumpic=s=${finalWidth}x${height}:legend=disabled:scale=log" ` +
-        `"${outPng}"`
+        `ffmpeg -y -hide_banner -loglevel error -i "${wavPath}" ` +
+        `-lavfi "showspectrumpic=s=1920x480:legend=disabled:scale=log:colors=gray" ` +
+        `"${outPng}"`;
       console.log("🛠 ffmpeg:", cmd);
       execSync(cmd, { stdio: "inherit" });
     }
