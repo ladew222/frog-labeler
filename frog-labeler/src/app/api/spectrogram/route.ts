@@ -66,10 +66,15 @@ export async function GET(req: Request) {
     if (forceRegen || !existsSync(outPng)) {
       const cmd =
         `ffmpeg -y -hide_banner -loglevel error -i "${wavPath}" ` +
-        `-lavfi "highpass=f=150,lowpass=f=3950,` +
-        `showspectrumpic=s=1920x480:legend=disabled:scale=log:drange=65,` +
-        `format=gray" ` +
-        `"${outPng}"`;
+        `-lavfi "` +
+        `highpass=f=120,` +
+        `showspectrum=s=1920x480:` +
+        `mode=combined:` +
+        `scale=log:` +
+        `drange=45:` +
+        `color=gray` +
+        `" -frames:v 1 "${outPng}"`;
+
 
 
 
