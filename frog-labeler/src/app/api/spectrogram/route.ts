@@ -1,6 +1,5 @@
-// app/api/spectrogram/route.ts
 import { NextResponse } from "next/server";
-import { mkdirSync, readFileSync, existsSync, statSync } from "fs";
+import { mkdirSync, readFileSync, existsSync } from "fs";
 import path from "path";
 import { execSync } from "child_process";
 import { createHash } from "crypto";
@@ -8,7 +7,17 @@ import { createHash } from "crypto";
 const AUDIO_ROOT = process.env.AUDIO_ROOT || "/Volumes/frog/Data";
 const SPECTRO_ROOT = process.env.SPECTRO_ROOT || "/Volumes/frog/frog-spectrograms";
 
-// --- helpers ---------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// helpers
+// ---------------------------------------------------------------------------
+
+function safeJoin(root: string, rel: string) {
+  const p = path.normalize(path.join(root, rel));
+  if (!p.startsWith(path.normalize(root))) {
+    throw new Error("Invalid path");
+  }
+  return p;
+}
 
 function ffprobeDurationSeconds(wavPath: string): number {
   try {
@@ -24,15 +33,9 @@ function ffprobeDurationSeconds(wavPath: string): number {
   }
 }
 
-function safeJoin(root: string, rel: string) {
-  const p = path.normalize(path.join(root, rel));
-  if (!p.startsWith(path.normalize(root))) {
-    throw new Error("Invalid path");
-  }
-  return p;
-}
-
-// --- route ----------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// route
+// ---------------------------------------------------------------------------
 
 export async function GET(req: Request) {
   try {
@@ -42,13 +45,20 @@ export async function GET(req: Request) {
       return NextResponse.json({ error: "Missing uri" }, { status: 400 });
     }
 
-    const pxPerSec = Math.max(60, Math.min(300, Number(searchParams.get("pxPerSec")) || 120));
-    const height = Math.max(160, Math.min(1024, Number(searchParams.get("height")) || 480));
+    const pxPerSec = Math.max(
+      60,
+      Math.min(300, Number(searchParams.get("pxPerSec")) || 120)
+    );
+    const height = Math.max(
+      160,
+      Math.min(1024, Number(searchParams.get("height")) || 480)
+    );
     const forceRegen = searchParams.get("regen") === "1";
 
     const relativePath = decodeURIComponent(uri).replace(/^\/?audio\//, "");
     const wavPath = safeJoin(AUDIO_ROOT, relativePath);
     const outPng = safeJoin(SPECTRO_ROOT, relativePath + ".png");
+    const rawPng = outPng.replace(/\.png$/, ".raw.png");
 
     if (!existsSync(wavPath)) {
       return NextResponse.json({ error: "Audio not found" }, { status: 404 });
@@ -56,40 +66,45 @@ export async function GET(req: Request) {
 
     mkdirSync(path.dirname(outPng), { recursive: true });
 
-    // --- Determine spectrogram width ---
-    const duration = ffprobeDurationSeconds(wavPath) || 0;
-    const width = duration > 0 ? Math.round(duration * pxPerSec) : 300 * pxPerSec;
-    const maxWidth = 20000;
-    const finalWidth = Math.min(width, maxWidth);
+    // ---- determine width from duration ----
+    const duration = ffprobeDurationSeconds(wavPath);
+    const width =
+      duration > 0 ? Math.round(duration * pxPerSec) : 300 * pxPerSec;
+    const finalWidth = Math.min(width, 20000);
 
-    // --- Generate only if missing or forced ---
+    // ---- generate spectrogram if needed ----
     if (forceRegen || !existsSync(outPng)) {
-      const cmd =
+      // 1) FFT-only spectrogram (FFmpeg)
+      const cmd1 =
         `ffmpeg -y -hide_banner -loglevel error -i "${wavPath}" ` +
-        `-lavfi "` +
-        `highpass=f=120,` +
-        `lowpass=f=4000,` +
-        `showspectrumpic=s=1920x480:` +
-        `scale=log:` +
-        `drange=45,` +
-        `format=gray` +
-        `" "${outPng}"`;
+        `-lavfi "showspectrumpic=s=${finalWidth}x${height}:legend=disabled:scale=log" ` +
+        `"${rawPng}"`;
 
+      // 2) Contrast normalization (ImageMagick)
+      const cmd2 =
+        `convert "${rawPng}" ` +
+        `-auto-level ` +
+        `-gamma 0.85 ` +
+        `-contrast-stretch 0.5%x0.5% ` +
+        `"${outPng}"`;
 
+      console.log("🛠 ffmpeg:", cmd1);
+      execSync(cmd1, { stdio: "inherit" });
 
+      console.log("🎚 normalize:", cmd2);
+      execSync(cmd2, { stdio: "inherit" });
 
-
-
-      console.log("🛠 ffmpeg:", cmd);
-      execSync(cmd, { stdio: "inherit" });
+      // optional cleanup
+      try {
+        execSync(`rm -f "${rawPng}"`);
+      } catch {}
     }
 
-    // --- Read PNG and compute hash for ETag ---
+    // ---- serve with strong caching ----
     const png = readFileSync(outPng);
     const hash = createHash("md5").update(png).digest("hex");
     const etag = `"${hash}"`;
 
-    // --- Check client’s If-None-Match for instant 304 response ---
     const ifNoneMatch = req.headers.get("if-none-match");
     if (ifNoneMatch === etag) {
       return new NextResponse(null, {
@@ -101,19 +116,18 @@ export async function GET(req: Request) {
       });
     }
 
-    // --- Serve PNG with long-term caching ---
-    const res = new NextResponse(png, {
+    return new NextResponse(png, {
       headers: {
         "Content-Type": "image/png",
         "Cache-Control": "public, max-age=31536000, immutable",
         ETag: etag,
       },
     });
-
-    console.log(`✅ Serving ${forceRegen ? "regenerated" : "cached"} spectrogram:`, outPng);
-    return res;
   } catch (err: any) {
-    console.error("❌ Spectrogram generation error:", err?.message || err);
-    return NextResponse.json({ error: err?.message || "Internal error" }, { status: 500 });
+    console.error("❌ Spectrogram error:", err?.message || err);
+    return NextResponse.json(
+      { error: err?.message || "Internal error" },
+      { status: 500 }
+    );
   }
 }

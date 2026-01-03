@@ -46,29 +46,39 @@ async function processBatch(folder: string, paths: string[], concurrency = 8) {
           markFileDone(folder, rel);
           continue;
         }
-        const cmd =
-          `ffmpeg -y -hide_banner -loglevel error -i "${wavPath}" ` +
-          `-lavfi "` +
-          `highpass=f=120,` +
-          `lowpass=f=4000,` +
-          `showspectrumpic=s=1920x480:` +
-          `scale=log:` +
-          `drange=45,` +
-          `format=gray` +
-          `" "${outPng}"`;
+        const rawPng = outPng.replace(/\.png$/, ".raw.png");
 
+        const cmd1 =
+          `ffmpeg -y -hide_banner -loglevel error -i "${wavPath}" ` +
+          `-lavfi "showspectrumpic=s=1920x480:legend=disabled:scale=log" ` +
+          `"${rawPng}"`;
+
+        const cmd2 =
+          `convert "${rawPng}" ` +
+          `-auto-level ` +
+          `-gamma 0.85 ` +
+          `-contrast-stretch 0.5%x0.5% ` +
+          `"${outPng}"`;
 
 
         await new Promise<void>((resolve) => {
-          exec(cmd, (err) => {
-            if (err) {
-              console.error(`❌ Failed: ${rel} (${err.message})`);
+          exec(cmd1, (err1) => {
+            if (err1) {
+              console.error(`❌ FFmpeg failed: ${rel} (${err1.message})`);
               errors++;
-            } else {
-              console.log(`🛠 Generated: ${rel}`);
-              markFileDone(folder, rel);
+              return resolve();
             }
-            resolve();
+
+            exec(cmd2, (err2) => {
+              if (err2) {
+                console.error(`❌ Post-process failed: ${rel} (${err2.message})`);
+                errors++;
+              } else {
+                console.log(`🛠 Generated (normalized): ${rel}`);
+                markFileDone(folder, rel);
+              }
+              resolve();
+            });
           });
         });
       } catch (err: any) {
