@@ -49,11 +49,19 @@ async function processBatch(folder: string, paths: string[], concurrency = 8) {
 
         const cmd =
           `ffmpeg -y -hide_banner -loglevel error -i "${wavPath}" ` +
-          `-lavfi "highpass=f=150,lowpass=f=3950,` +
-          `showspectrumpic=s=1920x480:legend=disabled:scale=log:` +
-          `win_size=1024:overlap=768:drange=70,` +
-          `format=gray" ` +
-          `"${outPng}"`;
+          `-lavfi "` +
+          `highpass=f=150,` +
+          `lowpass=f=3950,` +
+          `showspectrumpic=` +
+          `s=1920x480:` +
+          `legend=disabled:` +
+          `scale=log:` +
+          `win_size=1024:` +
+          `overlap=768:` +
+          `drange=70,` +
+          `format=gray` +
+          `" "${outPng}"`;
+
 
 
 
