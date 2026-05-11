@@ -24,6 +24,16 @@ type LabelRow = {
 const toNum = (v: number | "") =>
   v === "" || Number.isNaN(Number(v)) ? undefined : Number(v);
 
+// SegmentRow.label requires color: string | null, but LabelRow allows undefined.
+// Use this when stamping a LabelRow onto a SegmentRow to satisfy the type.
+type SegmentLabel = { id: string; name: string; color: string | null; hotkey: string | null };
+const toSegmentLabel = (l: { id: string; name: string; color?: string | null; hotkey: string | null }): SegmentLabel => ({
+  id: l.id,
+  name: l.name,
+  color: l.color ?? null,
+  hotkey: l.hotkey,
+});
+
 type SegmentRow = {
   id: string;
   audioId: string;
@@ -71,18 +81,18 @@ async function updateSegment(segmentId: string, data: Partial<SegmentRow>): Prom
 }
 function screenToSpectroX(
   e: React.MouseEvent<HTMLDivElement>,
-  containerRef: React.RefObject<HTMLDivElement>,
+  containerRef: React.RefObject<HTMLDivElement | null>,
   zoom: number
 ): number {
   const inner = containerRef.current;
   if (!inner) return 0;
 
-  const sc = inner.parentElement as HTMLElement;
-  if (!sc) return 0;
-
+  // getBoundingClientRect() already accounts for the parent's scrollLeft —
+  // when the parent scrolls right, `rect.left` becomes more negative.
+  // So `e.clientX - rect.left` is the displayed pixel offset inside the
+  // (already-scrolled) inner element. DO NOT add scrollLeft again.
   const rect = inner.getBoundingClientRect();
-  const scrollLeft = sc.scrollLeft;
-  const xDisplay = e.clientX - rect.left + scrollLeft;
+  const xDisplay = e.clientX - rect.left;
 
   // Convert to intrinsic coordinate space (unscaled image)
   const xIntrinsic = xDisplay / zoom;
@@ -123,24 +133,16 @@ const overlayCanvasRef = useRef<HTMLCanvasElement | null>(null);
 
   const [zoom, setZoom] = useState(1);
   const [displayWidth, setDisplayWidth] = useState<number>(0);
-  // 👇 Add this line
-  const [timeOffset, setTimeOffset] = useState(.25);
+  const [timeOffset, setTimeOffset] = useState(0.25);
 
-  // ... rest of your state unchanged ...
-  useEffect(() => {
-  console.log("🔍 Zoom changed →", zoom);
-}, [zoom]);
-useEffect(() => {
-  console.log("🎚️ Current time offset:", timeOffset);
-}, [timeOffset]);
-
-
-useEffect(() => {
-  if (!displayWidth || !duration) return;
-  console.log(`🧮 displayWidth=${displayWidth}px → ${displayPxPerSecond.toFixed(2)} px/sec`);
-}, [displayWidth, duration]);
-
-
+  // ---- Validation / debug overlay state ----
+  const [showDebug, setShowDebug] = useState(false);
+  const [scrollLeftPx, setScrollLeftPx] = useState(0);
+  const [debugCursor, setDebugCursor] = useState<{
+    xDisplay: number;
+    xIntrinsic: number;
+    t: number;
+  } | null>(null);
 
 useEffect(() => {
   const container = containerRef.current;
@@ -156,6 +158,39 @@ useEffect(() => {
   // Cleanup on unmount
   return () => observer.disconnect();
 }, []);
+
+// Track scrollLeft of the scroll parent so the navigator blue box and
+// "Visible: …" readout stay accurate.
+//
+// We can't rely on scroll events alone here — empirically they sometimes
+// don't reach React state (likely a Next/turbopack interplay with the
+// element-mount timing on this page). Instead, combine a scroll listener
+// (fast path) with a requestAnimationFrame poll that reads sc.scrollLeft
+// and only setState's when it actually changes. The poll is a no-op when
+// scroll position is stable, so it costs effectively nothing.
+useEffect(() => {
+  const sc = containerRef.current?.parentElement;
+  if (!sc) return;
+  let last = -1;
+  const sync = () => {
+    if (sc.scrollLeft !== last) {
+      last = sc.scrollLeft;
+      setScrollLeftPx(last);
+    }
+  };
+  let frameId = requestAnimationFrame(function tick() {
+    sync();
+    frameId = requestAnimationFrame(tick);
+  });
+  sc.addEventListener("scroll", sync, { passive: true });
+  sync();
+  return () => {
+    sc.removeEventListener("scroll", sync);
+    cancelAnimationFrame(frameId);
+  };
+  // displayWidth flips from 0 to non-zero once the inner container mounts;
+  // `audio` re-runs the effect when navigating to a different file.
+}, [displayWidth, audio]);
 
 
 
@@ -304,39 +339,16 @@ const naturalHeight = spectrogramImage?.naturalHeight ?? 192;
 
 
 
-// Load the spectrogram image once
-/** ------- Load spectrogram image after audio duration is known ------- */
+// Load the spectrogram image once when path + duration are known.
 useEffect(() => {
   if (!spectrogramPath || duration === 0) return;
-  console.log("🖼️ Loading spectrogram:", spectrogramPath);
-
   const img = new Image();
- img.crossOrigin = "anonymous"; // handles local + deployed CORS
-img.onload = () => {
-  console.log("✅ Spectrogram loaded OK", img.src);
-  console.log("⏱ Audio duration:", duration, "s");
-  console.log("🖼 Spectrogram width:", img.naturalWidth, "px");
-  console.log("=> secondsPerPixel =", duration / img.naturalWidth);
-
-  setSpectrogramImage(img);
-};
-img.onerror = () => {
-  console.error("❌ Failed to load spectrogram image:", img.src);
-};
-
-img.crossOrigin = "anonymous"; // handles local + deployed CORS
-img.onload = () => {
-  console.log("✅ Spectrogram loaded OK", img.src);
-  setSpectrogramImage(img);
-};
-
-
   img.crossOrigin = "anonymous"; // handles local + deployed CORS
-  img.onerror = () => {
-    console.error("❌ Failed to load spectrogram image:", img.src);
-  };
-  img.src = `${spectrogramPath}&t=${Date.now()}`; // cache-bust
-
+  img.onload = () => setSpectrogramImage(img);
+  img.onerror = () => console.error("Failed to load spectrogram image:", img.src);
+  // No cache-buster: the spectrogram PNG is a deterministic function of the
+  // audio file. Letting the browser cache it makes reloads instant.
+  img.src = spectrogramPath;
 }, [spectrogramPath, duration]);
 
 /** ------- Redraw spectrogram on zoom or when image/duration ready ------- */
@@ -360,97 +372,82 @@ useEffect(() => {
   ctx.imageSmoothingEnabled = false;
   ctx.drawImage(spectrogramImage, 0, 0);
 
-  console.log(`🎨 Drawn at native width ${naturalWidth}`);
-
-  // Tell overlays to use this width instead of PX_PER_SEC
-  // (you’ll use this when converting time <-> x)
+  // Overlays compute positions from `timeToDisplayX(t)` which already
+  // accounts for naturalWidth + zoom; nothing to do here.
 }, [spectrogramImage]);
 
-// --- Draw playhead whenever currentTime changes ---
-// --- Smooth playhead drawing loop ---
+// (No canvas-drawn playhead. The HTML overlay div below tracks
+// `currentTime + timeOffset` and updates in real time without going stale
+// on pause. The canvas just shows the spectrogram image, redrawn by the
+// useEffect above only when the image, duration, or zoom logic changes.) // 👈 ADD timeOffset here
+
+
+
+// --- When the user scrubs the audio (drags the HTML audio progress bar),
+// pull the spectrogram view along if the new time is off-screen. Without
+// this the audio scrubber and the spectrogram appear unrelated.
 useEffect(() => {
-  const canvas = spectrogramCanvasRef.current;
-  const ctx = canvas?.getContext("2d");
   const el = audioRef.current;
-  if (!canvas || !ctx || !spectrogramImage || !duration || !el) return;
-
-  const { naturalWidth, naturalHeight } = spectrogramImage;
-  const secondsPerPixel = duration / naturalWidth;
-  let frameId: number;
-
-  const draw = () => {
-    if (!ctx) return;
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
-    ctx.drawImage(spectrogramImage, 0, 0);
-
-    // ✅ Now includes updated offset
-    const x = (el.currentTime + timeOffset) / secondsPerPixel;
-
-    ctx.beginPath();
-    ctx.moveTo(x, 0);
-    ctx.lineTo(x, naturalHeight);
-    ctx.strokeStyle = "rgba(255,255,255,0.9)";
-    ctx.lineWidth = 2;
-    ctx.stroke();
-
-    frameId = requestAnimationFrame(draw);
+  if (!el || !duration || !naturalWidth) return;
+  const onSeeked = () => {
+    const sc = containerRef.current?.parentElement;
+    if (!sc) return;
+    const t = el.currentTime;
+    const x = (t / duration) * (naturalWidth * zoom);
+    if (x < sc.scrollLeft || x > sc.scrollLeft + sc.clientWidth) {
+      sc.scrollTo({ left: Math.max(0, x - sc.clientWidth / 2), behavior: "smooth" });
+    }
   };
+  el.addEventListener("seeked", onSeeked);
+  return () => el.removeEventListener("seeked", onSeeked);
+}, [duration, naturalWidth, zoom]);
 
-  const onPlay = () => {
-    frameId = requestAnimationFrame(draw);
-  };
-  const onPause = () => cancelAnimationFrame(frameId);
-
-  el.addEventListener("play", onPlay);
-  el.addEventListener("pause", onPause);
-  if (!el.paused) frameId = requestAnimationFrame(draw);
-
-  return () => {
-    el.removeEventListener("play", onPlay);
-    el.removeEventListener("pause", onPause);
-    cancelAnimationFrame(frameId);
-  };
-}, [spectrogramImage, duration, timeOffset]); // 👈 ADD timeOffset here
-
-
-
-// --- Auto-scroll as playhead moves ---
-// --- Auto-scroll as playhead moves (keep playhead at start of view) ---
+// --- Auto-scroll the spectrogram to keep the playhead in view, but only
+// while audio is actually playing. Uses direct scrollLeft assignment
+// (instead of scrollTo({behavior:"smooth"}) every frame, which restarts
+// the smooth animation each call and fights itself).
 useEffect(() => {
   const container = containerRef.current?.parentElement;
-  if (!container || !spectrogramImage || !duration) return;
+  const el = audioRef.current;
+  if (!container || !el || !spectrogramImage || !duration) return;
 
   const { naturalWidth } = spectrogramImage;
   const pxPerSec = (naturalWidth * zoom) / duration;
-  const visibleWidth = container.clientWidth;
 
-  let frameId: number;
+  let frameId: number | null = null;
 
-  const updateScroll = () => {
-    const playheadX = (audioRef.current?.currentTime ?? 0) * pxPerSec;
+  const tick = () => {
+    const playheadX = (el.currentTime ?? 0) * pxPerSec;
+    const visibleWidth = container.clientWidth;
     const scrollLeft = container.scrollLeft;
 
-    // If playhead moves beyond the right edge → advance so it’s near left edge
     if (playheadX > scrollLeft + visibleWidth - 50) {
-      container.scrollTo({
-        left: playheadX - 20,  // small padding before the playhead
-        behavior: "smooth",
-      });
+      container.scrollLeft = playheadX - 20;
+    } else if (playheadX < scrollLeft + 20) {
+      container.scrollLeft = Math.max(0, playheadX - 20);
     }
-
-    // Optional: if user scrubs backward, bring playhead into view again
-    if (playheadX < scrollLeft + 20) {
-      container.scrollTo({
-        left: Math.max(0, playheadX - 20),
-        behavior: "smooth",
-      });
-    }
-
-    frameId = requestAnimationFrame(updateScroll);
+    frameId = requestAnimationFrame(tick);
   };
 
-  frameId = requestAnimationFrame(updateScroll);
-  return () => cancelAnimationFrame(frameId);
+  const start = () => {
+    if (frameId == null) frameId = requestAnimationFrame(tick);
+  };
+  const stop = () => {
+    if (frameId != null) cancelAnimationFrame(frameId);
+    frameId = null;
+  };
+
+  el.addEventListener("play", start);
+  el.addEventListener("pause", stop);
+  el.addEventListener("ended", stop);
+  if (!el.paused) start();
+
+  return () => {
+    el.removeEventListener("play", start);
+    el.removeEventListener("pause", stop);
+    el.removeEventListener("ended", stop);
+    stop();
+  };
 }, [spectrogramImage, zoom, duration]);
 
 
@@ -480,9 +477,16 @@ const onMouseDown = (e: React.MouseEvent<HTMLDivElement>) => {
 
 
 const onMouseMove = (e: React.MouseEvent<HTMLDivElement>) => {
+  const xIntrinsic = screenToSpectroX(e, containerRef, zoom);
+  if (showDebug) {
+    const xDisplay = xIntrinsic * zoom;
+    const t = duration > 0 && naturalWidth > 0
+      ? xIntrinsic * (duration / naturalWidth)
+      : 0;
+    setDebugCursor({ xDisplay, xIntrinsic, t });
+  }
   if (dragPxStart == null) return;
-  const x = screenToSpectroX(e, containerRef, zoom);
-  setDragPxEnd(x);
+  setDragPxEnd(xIntrinsic);
 };
 
 
@@ -507,7 +511,15 @@ const onMouseUp = () => {
   setDragPxStart(null);
   setDragPxEnd(null);
 
-  console.log("🖱️ Selection →", { startIntrinsic, endIntrinsic, tS, tE, zoom });
+  // Auto-scroll: if the new selection is outside the viewport (common at
+  // high zoom), bring it into view.
+  const sc = containerRef.current?.parentElement;
+  if (sc) {
+    const xMid = ((tS + tE) / 2 / duration) * (naturalWidth * zoom);
+    if (xMid < sc.scrollLeft || xMid > sc.scrollLeft + sc.clientWidth) {
+      sc.scrollTo({ left: Math.max(0, xMid - sc.clientWidth / 2), behavior: "smooth" });
+    }
+  }
 };
 
 
@@ -515,6 +527,20 @@ const onMouseUp = () => {
   /** ------- Keyboard shortcuts ------- */
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
+      // Don't intercept keys while the user is typing in a form field.
+      const tgt = e.target as HTMLElement | null;
+      if (tgt) {
+        const tag = tgt.tagName;
+        if (
+          tag === "INPUT" ||
+          tag === "TEXTAREA" ||
+          tag === "SELECT" ||
+          tgt.isContentEditable
+        ) {
+          return;
+        }
+      }
+
       const el = audioRef.current;
       if (!el) return;
 
@@ -551,6 +577,25 @@ const onMouseUp = () => {
         setSelEnd(Math.min(duration || v, v));
         return;
       }
+      // f = Fit zoom so whole file is visible
+      if (e.key === "f") {
+        const sc = containerRef.current?.parentElement;
+        if (sc && naturalWidth) {
+          setZoom(Math.max(0.01, sc.clientWidth / naturalWidth));
+          sc.scrollLeft = 0;
+        }
+        return;
+      }
+      // c = Center the playhead in the viewport
+      if (e.key === "c") {
+        const sc = containerRef.current?.parentElement;
+        if (sc) {
+          const t = el.currentTime ?? 0;
+          const x = (t / duration) * (naturalWidth * zoom);
+          sc.scrollTo({ left: Math.max(0, x - sc.clientWidth / 2), behavior: "smooth" });
+        }
+        return;
+      }
       const labelId = hotkeyToLabelId[e.key];
       if (labelId) {
         e.preventDefault();
@@ -559,7 +604,7 @@ const onMouseUp = () => {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [duration, selStart, selEnd, hotkeyToLabelId]);
+  }, [duration, selStart, selEnd, hotkeyToLabelId, naturalWidth, zoom]);
 
 
 
@@ -592,7 +637,7 @@ const onMouseUp = () => {
       const saved: SegmentRow = await res.json();
 
       // add to table (label object included)
-      setSegments((prev) => [...prev, { ...saved, label: labelById[labelId] }]);
+      setSegments((prev) => [...prev, { ...saved, label: toSegmentLabel(labelById[labelId]) }]);
 
       setToast("Saved ✓");
       setTimeout(() => setToast(null), 1000);
@@ -658,7 +703,9 @@ const onMouseUp = () => {
         prev.map((s) => {
           if (s.id !== segmentId) return s;
           const newLabelId = nextLabelId ?? s.labelId;
-          const newLabelObj = labelById[newLabelId] ?? s.label;
+          const newLabelObj = labelById[newLabelId]
+            ? toSegmentLabel(labelById[newLabelId])
+            : s.label;
           return { ...s, ...updated, labelId: newLabelId, label: newLabelObj };
         })
       );
@@ -693,9 +740,15 @@ const onMouseUp = () => {
     const seg = segments.find((s) => s.id === segId);
     const el = audioRef.current;
     if (!seg || !el) return;
-    const mid = seg.startS + Math.min(0.05, Math.max(0, seg.endS - seg.startS) / 2);
+    const mid = seg.startS + Math.max(0, seg.endS - seg.startS) / 2;
     el.currentTime = mid;
     if (play) el.play().catch(() => {});
+    // Scroll the spectrogram horizontally so the segment is centered.
+    const sc = containerRef.current?.parentElement;
+    if (sc) {
+      const x = timeToDisplayX(mid);
+      sc.scrollTo({ left: Math.max(0, x - sc.clientWidth / 2), behavior: "smooth" });
+    }
     // flash overlay rectangle
     const dom = document.querySelector<HTMLElement>(`[data-seg-box="${segId}"]`);
     if (dom) {
@@ -733,19 +786,86 @@ const onMouseUp = () => {
       </h1>
 
       {/* Spectrogram + overlay */}
-  {/* Zoom controls */}
-<div className="flex items-center gap-3 text-sm">
+  {/* Zoom + navigation controls */}
+<div className="flex items-center gap-3 text-sm flex-wrap">
   <label>Zoom:</label>
   <input
     type="range"
-    min={1}
-    max={10}
-    step={0.1}
+    min={0.05}
+    max={20}
+    step={0.05}
     value={zoom}
     onChange={(e) => setZoom(parseFloat(e.target.value))}
     className="w-48"
   />
-  <span>{zoom.toFixed(1)}×</span>
+  <span className="font-mono w-14">{zoom.toFixed(2)}×</span>
+
+  {/* Fit-to-view: zoom level that makes whole file fit the viewport */}
+  <button
+    type="button"
+    className="border px-2 py-0.5 rounded hover:bg-slate-50"
+    onClick={() => {
+      const sc = containerRef.current?.parentElement;
+      if (!sc || !naturalWidth) return;
+      const fit = Math.max(0.01, sc.clientWidth / naturalWidth);
+      setZoom(fit);
+      sc.scrollLeft = 0;
+    }}
+    title="Zoom out so the entire file fits in the viewport"
+  >
+    Fit
+  </button>
+
+  {/* 1× quick reset */}
+  <button
+    type="button"
+    className="border px-2 py-0.5 rounded hover:bg-slate-50"
+    onClick={() => setZoom(1)}
+    title="Reset zoom to 1×"
+  >
+    1×
+  </button>
+
+  {/* Center the playhead in the viewport */}
+  <button
+    type="button"
+    className="border px-2 py-0.5 rounded hover:bg-slate-50"
+    onClick={() => {
+      const sc = containerRef.current?.parentElement;
+      if (!sc) return;
+      const t = audioRef.current?.currentTime ?? 0;
+      const x = timeToDisplayX(t);
+      sc.scrollTo({ left: Math.max(0, x - sc.clientWidth / 2), behavior: "smooth" });
+    }}
+    title="Scroll so the audio playhead is centered"
+  >
+    Scroll to playhead
+  </button>
+
+  {/* Jump-to-time input */}
+  <label className="flex items-center gap-1">
+    Jump to:
+    <input
+      type="number"
+      min={0}
+      max={duration || undefined}
+      step={0.1}
+      placeholder="sec"
+      className="border rounded px-2 py-0.5 w-20"
+      onKeyDown={(e) => {
+        if (e.key !== "Enter") return;
+        const t = parseFloat((e.target as HTMLInputElement).value);
+        if (!isFinite(t)) return;
+        const sc = containerRef.current?.parentElement;
+        if (audioRef.current) audioRef.current.currentTime = Math.max(0, Math.min(duration, t));
+        if (sc) {
+          const x = timeToDisplayX(t);
+          sc.scrollTo({ left: Math.max(0, x - sc.clientWidth / 2), behavior: "smooth" });
+        }
+      }}
+    />
+    <span className="text-slate-500 text-xs">(press Enter)</span>
+  </label>
 </div>
 {/* Offset tuning control */}
 <div className="flex items-center gap-3 text-sm">
@@ -763,8 +883,28 @@ const onMouseUp = () => {
   <span className="text-slate-500 text-xs">(negative = earlier, positive = later)</span>
 </div>
 
-{/* === Canvas-based spectrogram === */}
-<div className="relative border rounded overflow-x-auto bg-black" style={{ height: "12rem" }}>
+{/* Debug / validation toggle */}
+<div className="flex items-center gap-3 text-sm">
+  <label className="flex items-center gap-1">
+    <input
+      type="checkbox"
+      checked={showDebug}
+      onChange={(e) => setShowDebug(e.target.checked)}
+    />
+    Debug overlay
+  </label>
+  <span className="text-slate-500 text-xs">
+    Shows a 1-second time grid + live cursor → time readout. Use it to
+    verify saved boxes line up after scroll/zoom.
+  </span>
+</div>
+
+{/* === Canvas-based spectrogram ===
+    Custom scrollbar styles for `.spec-scroll` live in src/app/globals.css. */}
+<div
+  className="relative border rounded bg-black spec-scroll"
+  style={{ height: "12rem" }}
+>
 <div
   ref={containerRef}
   className="relative h-full"
@@ -780,7 +920,6 @@ const onMouseUp = () => {
   onMouseUp={onMouseUp}
   onMouseLeave={() => {
     if (dragPxStart != null) {
-      console.warn("⚠️ Mouse left area during drag — cancelling");
       setDragPxStart(null);
       setDragPxEnd(null);
     }
@@ -797,7 +936,10 @@ const onMouseUp = () => {
   <div
     className="absolute top-0 bottom-0 w-[2px] bg-red-500 pointer-events-none"
     style={{
-      left: `${timeToDisplayX(selStart) - (containerRef.current?.parentElement?.scrollLeft ?? 0)}px`,
+      // debugClickX is in *intrinsic* pixels; multiply by zoom for display.
+      // Overlays live inside the inner (scrolling) container, so DO NOT
+      // subtract scrollLeft — the inner container already scrolls.
+      left: `${debugClickX * zoom}px`,
       zIndex: 10,
     }}
   />
@@ -815,8 +957,10 @@ const onMouseUp = () => {
           data-seg-box={s.id}
           className="absolute top-0 bottom-0 border-x-2 pointer-events-none opacity-50"
           style={{
-            left: `${timeToDisplayX(s.startS) - (containerRef.current?.parentElement?.scrollLeft ?? 0)}px`,
-            width: `${(timeToX(s.endS) - timeToX(s.startS)) * zoom}px`,
+            // Anchor inside the scrolling content. timeToDisplayX already
+            // includes the zoom factor; do NOT subtract scrollLeft.
+            left: `${timeToDisplayX(s.startS)}px`,
+            width: `${timeToDisplayX(s.endS) - timeToDisplayX(s.startS)}px`,
             background: baseToRgba(color, 0.25),
             borderColor: color,
             zIndex: 3,
@@ -832,7 +976,7 @@ const onMouseUp = () => {
   <div
     className="absolute top-0 bottom-0 bg-green-500/25 border-x border-green-400 pointer-events-none"
     style={{
-      left: `${timeToDisplayX(selStart) - (containerRef.current?.parentElement?.scrollLeft ?? 0)}px`,
+      left: `${timeToDisplayX(selStart)}px`,
       width: `${timeToDisplayX(selEnd) - timeToDisplayX(selStart)}px`,
       zIndex: 5,
     }}
@@ -845,7 +989,9 @@ const onMouseUp = () => {
       <div
         className="absolute top-0 bottom-0 bg-blue-500/30 border-x border-blue-400 pointer-events-none"
         style={{
-          left: `${Math.min(dragPxStart, dragPxEnd) * zoom - (containerRef.current?.parentElement?.scrollLeft ?? 0)}px`,
+          // dragPxStart/End are intrinsic pixels; scale to display by * zoom.
+          // Inside the scrolling container — no scrollLeft subtraction.
+          left: `${Math.min(dragPxStart, dragPxEnd) * zoom}px`,
           width: `${Math.abs(dragPxEnd - dragPxStart) * zoom}px`,
           zIndex: 6,
         }}
@@ -853,16 +999,211 @@ const onMouseUp = () => {
     )}
 
 
-    {/* Playhead */}
+    {/* Playhead — HTML overlay tracks the audio element's currentTime in
+        real time (no stale canvas state). Bright cyan w/ a glow so it's
+        visible against the spectrogram's intense colors. */}
     <div
-      className="absolute top-0 bottom-0 w-[2px] bg-white/80 pointer-events-none"
+      className="absolute top-0 bottom-0 pointer-events-none"
       style={{
-        left: `${timeToDisplayX(selStart) - (containerRef.current?.parentElement?.scrollLeft ?? 0)}px`,
+        left: `${timeToDisplayX(currentTime + timeOffset)}px`,
+        width: 3,
+        background: "#00e5ff",
+        boxShadow: "0 0 6px #00e5ff",
         zIndex: 7,
       }}
     />
+
+    {/* === Validation grid: 1s ticks (adaptive spacing) === */}
+    {showDebug && duration > 0 && (() => {
+      const pxPerSec = (naturalWidth * zoom) / duration;
+      // pick a tick step that keeps gaps roughly >= 25 display px
+      const step =
+        pxPerSec * 1 >= 25 ? 1 :
+        pxPerSec * 5 >= 25 ? 5 :
+        pxPerSec * 10 >= 25 ? 10 :
+        pxPerSec * 30 >= 25 ? 30 : 60;
+      const ticks: number[] = [];
+      for (let t = 0; t <= duration; t += step) ticks.push(t);
+      return ticks.map((t) => {
+        const major = step >= 5 ? true : t % 5 === 0;
+        return (
+          <div
+            key={`grid-${t}`}
+            className="absolute top-0 bottom-0 pointer-events-none"
+            style={{
+              left: `${timeToDisplayX(t)}px`,
+              width: 1,
+              background: major
+                ? "rgba(255, 215, 0, 0.85)"
+                : "rgba(255, 255, 255, 0.25)",
+              zIndex: 4,
+            }}
+          >
+            {major && (
+              <span
+                className="absolute top-0 left-1 text-[10px] text-yellow-300 font-mono"
+                style={{ textShadow: "0 0 3px black" }}
+              >
+                {t}s
+              </span>
+            )}
+          </div>
+        );
+      });
+    })()}
   </div>
 </div>
+
+{/* === Navigator strip ===
+    Mini-map of the entire file. Shows segment markers, the current playhead,
+    and a draggable highlighted box for the slice currently visible in the
+    spectrogram. Click anywhere on the strip = jump there. Click + drag the
+    blue box = scroll the spectrogram view in real time.
+*/}
+{duration > 0 && (() => {
+  const sc = containerRef.current?.parentElement;
+  const viewportPx = sc?.clientWidth ?? 0;
+  const totalPx = naturalWidth * zoom;
+  const visibleStartFrac = totalPx > 0 ? scrollLeftPx / totalPx : 0;
+  const visibleEndFrac = totalPx > 0 ? Math.min(1, (scrollLeftPx + viewportPx) / totalPx) : 1;
+  const visibleStartS = visibleStartFrac * duration;
+  const visibleEndS = visibleEndFrac * duration;
+  const playheadFrac = currentTime / duration;
+
+  // Click anywhere on the strip → jump audio + center spectrogram there.
+  const onJump = (e: React.MouseEvent<HTMLDivElement>) => {
+    const rect = e.currentTarget.getBoundingClientRect();
+    const frac = (e.clientX - rect.left) / rect.width;
+    const t = Math.max(0, Math.min(duration, frac * duration));
+    if (audioRef.current) audioRef.current.currentTime = t;
+    if (sc) {
+      const x = timeToDisplayX(t);
+      sc.scrollTo({ left: Math.max(0, x - sc.clientWidth / 2), behavior: "smooth" });
+    }
+  };
+
+  // Drag the blue visible-region box → scroll the spectrogram in real time.
+  // Uses window listeners so the drag continues even if the mouse leaves the
+  // tiny strip. Stops the click-to-jump from firing on mouseup.
+  const onBoxMouseDown = (e: React.MouseEvent<HTMLDivElement>) => {
+    e.stopPropagation();
+    e.preventDefault();
+    if (!sc) return;
+    const strip = e.currentTarget.parentElement as HTMLElement | null;
+    if (!strip) return;
+    const stripRect = strip.getBoundingClientRect();
+    const startMouseX = e.clientX;
+    const startScroll = sc.scrollLeft;
+    // Map: 1px on the strip = (totalPx / stripRect.width) px of scroll.
+    const ratio = totalPx / stripRect.width;
+    const onMove = (ev: MouseEvent) => {
+      const dx = ev.clientX - startMouseX;
+      sc.scrollLeft = Math.max(0, Math.min(totalPx - viewportPx, startScroll + dx * ratio));
+    };
+    const onUp = () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  };
+
+  return (
+    <div className="text-xs flex items-center gap-3 flex-wrap">
+      <span className="text-slate-600 whitespace-nowrap">
+        <span className="inline-block w-3 h-3 align-middle border-2 border-blue-500 bg-blue-400/30 mr-1" />
+        Visible: <code>{visibleStartS.toFixed(1)}</code>–<code>{visibleEndS.toFixed(1)}</code>s
+        of <code>{duration.toFixed(1)}</code>s
+        <span className="mx-2">·</span>
+        <span className="inline-block w-[3px] h-3 align-middle bg-red-600 mr-1" />
+        Audio: <code>{currentTime.toFixed(1)}</code>s
+      </span>
+      <div
+        className="relative flex-1 h-6 bg-slate-200 border rounded cursor-pointer select-none"
+        onClick={onJump}
+        title="Click to jump audio + spectrogram to this time. Drag the blue box to scroll the spectrogram."
+      >
+        {/* Segment markers */}
+        {segments.map((s) => {
+          const left = (s.startS / duration) * 100;
+          const width = Math.max(0.2, ((s.endS - s.startS) / duration) * 100);
+          return (
+            <div
+              key={`nav-${s.id}`}
+              className="absolute top-0 bottom-0 pointer-events-none"
+              style={{
+                left: `${left}%`,
+                width: `${width}%`,
+                background: s.label?.color
+                  ? baseToRgba(s.label.color, 0.7)
+                  : "rgba(34,197,94,0.7)",
+              }}
+              title={`${s.label?.name ?? "?"}: ${s.startS.toFixed(2)}–${s.endS.toFixed(2)}s`}
+            />
+          );
+        })}
+        {/* Visible-region highlight (draggable to scroll the spectrogram) */}
+        <div
+          className="absolute top-0 bottom-0 border-2 border-blue-500 bg-blue-400/20 cursor-grab active:cursor-grabbing"
+          style={{
+            left: `${visibleStartFrac * 100}%`,
+            width: `${Math.max(0.5, (visibleEndFrac - visibleStartFrac) * 100)}%`,
+          }}
+          onMouseDown={onBoxMouseDown}
+          title="Drag to scroll the spectrogram"
+        />
+        {/* Playhead marker — red line + downward triangle so it's obvious
+            where the audio currentTime is on the file's timeline. */}
+        <div
+          className="absolute top-0 bottom-0 w-[3px] bg-red-600 pointer-events-none"
+          style={{ left: `calc(${playheadFrac * 100}% - 1px)` }}
+        />
+        <div
+          className="absolute pointer-events-none"
+          style={{
+            left: `calc(${playheadFrac * 100}% - 5px)`,
+            top: -4,
+            width: 0,
+            height: 0,
+            borderLeft: "5px solid transparent",
+            borderRight: "5px solid transparent",
+            borderTop: "6px solid #dc2626",
+          }}
+        />
+      </div>
+    </div>
+  );
+})()}
+
+{/* === Validation readout panel === */}
+{showDebug && (
+  <div className="text-xs font-mono border rounded p-2 bg-slate-50 grid gap-x-4 gap-y-1 grid-cols-2 md:grid-cols-4">
+    <div>zoom: <span className="text-slate-700">{zoom.toFixed(2)}×</span></div>
+    <div>scrollLeft: <span className="text-slate-700">{scrollLeftPx.toFixed(1)} px</span></div>
+    <div>natural width: <span className="text-slate-700">{naturalWidth} px</span></div>
+    <div>display width: <span className="text-slate-700">{(naturalWidth * zoom).toFixed(1)} px</span></div>
+    <div>duration: <span className="text-slate-700">{duration.toFixed(3)} s</span></div>
+    <div>sec / intrinsic px: <span className="text-slate-700">{naturalWidth ? (duration / naturalWidth).toFixed(5) : "—"}</span></div>
+    <div>display px / sec: <span className="text-slate-700">{duration ? ((naturalWidth * zoom) / duration).toFixed(2) : "—"}</span></div>
+    <div>currentTime: <span className="text-slate-700">{currentTime.toFixed(3)} s</span></div>
+    <div className="col-span-2 md:col-span-4 border-t pt-1 mt-1">
+      cursor →{" "}
+      {debugCursor
+        ? <>
+            xDisplay <span className="text-slate-700">{debugCursor.xDisplay.toFixed(1)}</span>{" "}
+            · xIntrinsic <span className="text-slate-700">{debugCursor.xIntrinsic.toFixed(1)}</span>{" "}
+            · t = <span className="text-emerald-700">{debugCursor.t.toFixed(3)} s</span>
+          </>
+        : <span className="text-slate-400">move mouse over spectrogram…</span>}
+    </div>
+    <div className="col-span-2 md:col-span-4 text-[11px] text-slate-500">
+      Validation check: hover the cursor on a yellow grid line — the readout&apos;s
+      <code className="px-1">t</code> should equal the line&apos;s label. Saved boxes
+      should keep the same start/end seconds at every zoom level and after any
+      horizontal scroll.
+    </div>
+  </div>
+)}
 
 
 

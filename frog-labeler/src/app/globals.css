@@ -24,3 +24,27 @@ body {
   color: var(--foreground);
   font-family: Arial, Helvetica, sans-serif;
 }
+
+/* Annotator spectrogram scroll container.
+   macOS hides native scrollbars unless actively scrolling, so we force a
+   visible custom scrollbar via ::-webkit-scrollbar pseudo-elements.
+   These rules live in globals.css so they're guaranteed to be picked up
+   by Next.js's CSS pipeline (a per-component <style> tag is unreliable). */
+.spec-scroll {
+  overflow-x: scroll;
+  overflow-y: hidden;
+  scrollbar-width: auto;            /* Firefox */
+  scrollbar-color: #aaa #333;
+}
+.spec-scroll::-webkit-scrollbar {
+  height: 14px;
+  background: #222;
+}
+.spec-scroll::-webkit-scrollbar-thumb {
+  background: #888;
+  border: 2px solid #222;
+  border-radius: 7px;
+}
+.spec-scroll::-webkit-scrollbar-thumb:hover {
+  background: #bbb;
+}
