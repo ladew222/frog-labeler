@@ -202,6 +202,9 @@ useEffect(() => {
   const [notes, setNotes] = useState<string>("");
   const [confidence, setConfidence] = useState<number | "">("");
 
+  /** Tag-loop state: when set, the player loops the single segment with this id */
+  const [tagLoopSegmentId, setTagLoopSegmentId] = useState<string | null>(null);
+
   /** Editing row state */
   const [editingId, setEditingId] = useState<string | null>(null);
   type Draft = {
@@ -295,6 +298,54 @@ useEffect(() => {
       rAF.current = null;
     };
   }, [audio]);
+
+  /** ------- Tag loop: loop a single segment (by id) continuously ------- */
+  useEffect(() => {
+    if (!tagLoopSegmentId) return;
+    const el = audioRef.current;
+    if (!el) return;
+
+    const seg = segments.find((s) => s.id === tagLoopSegmentId);
+    if (!seg) {
+      setTagLoopSegmentId(null);
+      return;
+    }
+
+    // Seek to the start of the looped segment, scroll it into view, and flash it once.
+    el.currentTime = seg.startS;
+    const x = timeToDisplayX(seg.startS + (seg.endS - seg.startS) / 2);
+    const sc = containerRef.current?.parentElement;
+    if (sc) sc.scrollTo({ left: Math.max(0, x - sc.clientWidth / 2), behavior: "smooth" });
+    const row = document.querySelector<HTMLTableRowElement>(`[data-seg-row="${seg.id}"]`);
+    row?.scrollIntoView({ block: "center", behavior: "smooth" });
+    const dom = document.querySelector<HTMLElement>(`[data-seg-box="${seg.id}"]`);
+    if (dom) {
+      dom.classList.add("ring-2", "ring-amber-400");
+      setTimeout(() => dom.classList.remove("ring-2", "ring-amber-400"), 500);
+    }
+    el.play().catch(() => {});
+
+    let cancelled = false;
+    let rafId = 0;
+    const watch = () => {
+      if (cancelled) return;
+      if (el.currentTime >= seg.endS) {
+        el.currentTime = seg.startS;
+      }
+      rafId = requestAnimationFrame(watch);
+    };
+    rafId = requestAnimationFrame(watch);
+
+    return () => {
+      cancelled = true;
+      if (rafId) cancelAnimationFrame(rafId);
+    };
+  }, [tagLoopSegmentId, segments]);
+
+  /** Stop the tag loop whenever the audio file changes. */
+  useEffect(() => {
+    setTagLoopSegmentId(null);
+  }, [audioId]);
 
   /** ------- Pixel <-> time helpers ------- */
 // === Use native spectrogram width, not PX_PER_SEC ===
@@ -1602,6 +1653,29 @@ const onMouseUp = () => {
                             >
                               Go
                             </button>
+                            {tagLoopSegmentId === s.id ? (
+                              <button
+                                type="button"
+                                className="border px-2 py-0.5 rounded bg-amber-100 hover:bg-amber-200"
+                                onClick={() => {
+                                  const el = audioRef.current;
+                                  if (el) el.pause();
+                                  setTagLoopSegmentId(null);
+                                }}
+                                title="Stop looping this segment"
+                              >
+                                Stop loop
+                              </button>
+                            ) : (
+                              <button
+                                type="button"
+                                className="border px-2 py-0.5 rounded hover:bg-slate-50"
+                                onClick={() => setTagLoopSegmentId(s.id)}
+                                title={`Loop this "${s.label.name}" segment`}
+                              >
+                                Loop tag
+                              </button>
+                            )}
                             <button
                               type="button"
                               className="border px-2 py-0.5 rounded hover:bg-slate-50"
