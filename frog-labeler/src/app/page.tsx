@@ -11,6 +11,7 @@ import { db } from "@/lib/db";
 import { getUserProjectIds } from "@/lib/authz";
 import type { Prisma } from "@prisma/client";
 import { readActivityStatsForUri, type PeakStats } from "@/lib/peakStats";
+import { loadModelReportForUri } from "@/lib/modelResults";
 
 
 
@@ -40,6 +41,8 @@ type SP = {
   mdFrom?: string;   // e.g. "03-01"
   mdTo?: string;     // e.g. "05-31"
   notSilent?: string;
+  modelStatus?: string;
+  modelSpecies?: string;
 };
 
 function timeAgo(date: Date): string {
@@ -149,6 +152,76 @@ function ActivityBadge({ s }: { s: PeakStats | null }) {
   );
 }
 
+type ModelPreview = {
+  species: string;
+  count: number;
+  verdict: string;
+  confidence: number | null;
+}[];
+
+const MODEL_SPECIES_OPTIONS = [
+  "Blanchards_Cricket_Frog",
+  "Bullfrog",
+  "Gray_Tree_Frog",
+  "Green_Frog",
+  "Northern_Leopard",
+  "Peeper",
+  "Southern_Leopard_Frog",
+] as const;
+
+function formatSpeciesName(name: string): string {
+  return name.replaceAll("_", " ");
+}
+
+function speciesBadgeStyle(name: string) {
+  const colors: Record<string, { bg: string; fg: string }> = {
+    Blanchards_Cricket_Frog: { bg: "#ECF3D8", fg: "#4E6A1E" },
+    Bullfrog: { bg: "#D9EEF8", fg: "#1F5F87" },
+    Gray_Tree_Frog: { bg: "#EEE8F9", fg: "#5B4C8F" },
+    Green_Frog: { bg: "#DDF4EC", fg: "#1D7A67" },
+    Northern_Leopard: { bg: "#FBE6E0", fg: "#9A4F3C" },
+    Peeper: { bg: "#FAEDC7", fg: "#A06A00" },
+    Southern_Leopard_Frog: { bg: "#F3E2CF", fg: "#8A531A" },
+  };
+  return colors[name] || { bg: "#E5E7EB", fg: "#475569" };
+}
+
+function confidenceLabel(confidence: number | null | undefined) {
+  if (confidence == null) return "unknown";
+  if (confidence >= 0.75) return "high";
+  if (confidence >= 0.5) return "moderate";
+  return "low";
+}
+
+function ModelSummaryBadge({ model }: { model: ModelPreview | null }) {
+  if (model == null) {
+    return (
+      <span className="text-xs px-2 py-0.5 rounded bg-slate-100 text-slate-500">
+        no model
+      </span>
+    );
+  }
+  if (model.length === 0) {
+    return (
+      <span className="text-xs px-2 py-0.5 rounded bg-slate-100 text-slate-600">
+        model: none
+      </span>
+    );
+  }
+  const lead = model[0];
+  const colors = speciesBadgeStyle(lead.species);
+  return (
+    <span
+      className="text-xs px-2 py-0.5 rounded"
+      style={{ backgroundColor: colors.bg, color: colors.fg }}
+      title={model.map((m) => `${formatSpeciesName(m.species)} ${m.count} (${confidenceLabel(m.confidence)})`).join(" · ")}
+    >
+      model: {formatSpeciesName(lead.species)} {lead.count}
+      {model.length > 1 ? ` +${model.length - 1}` : ""} · {confidenceLabel(lead.confidence)}
+    </span>
+  );
+}
+
 
 
 /* --------------------------------- page ----------------------------------- */
@@ -202,6 +275,11 @@ export default async function Home({
   const siteParam   = (sp.site ?? "").trim();
   const folderParam = (sp.folder ?? "").trim();
   const notSilentParam = sp.notSilent === "true";
+  const modelStatusParam = (sp.modelStatus ?? "").trim();
+  const modelSpeciesParamRaw = (sp.modelSpecies ?? "").trim();
+  const modelSpeciesParam = MODEL_SPECIES_OPTIONS.includes(modelSpeciesParamRaw as (typeof MODEL_SPECIES_OPTIONS)[number])
+    ? modelSpeciesParamRaw
+    : "";
 
 
   // date inputs
@@ -314,8 +392,7 @@ const where: Prisma.AudioFileWhereInput | undefined =
   andFilters.length ? { AND: andFilters } : undefined;
 
 
-  // ----- totals -----
-  const total = await (where ? db.audioFile.count({ where }) : db.audioFile.count());
+  const usingModelFilters = Boolean(modelStatusParam || modelSpeciesParam);
 
 
   // ----- orderBy -----
@@ -367,8 +444,7 @@ const where: Prisma.AudioFileWhereInput | undefined =
 const filesRaw = await db.audioFile.findMany({
   ...(where ? { where } : {}),
   orderBy,
-  skip,
-  take: size,
+  ...(usingModelFilters ? {} : { skip, take: size }),
   include: {
     _count: { select: { segments: true } },
     project: { select: { id: true, name: true } },
@@ -376,11 +452,43 @@ const filesRaw = await db.audioFile.findMany({
 });
 
 // Attach precomputed stats server-side (no client fetch)
-const files = filesRaw.map((f) => {
-  const stats = readActivityStatsForUri(f.uri);
-  return { ...f, __stats: stats as PeakStats | null };
+const enrichedFiles = await Promise.all(
+  filesRaw.map(async (f) => {
+    const stats = readActivityStatsForUri(f.uri);
+    const report = await loadModelReportForUri(f.uri);
+    const modelTop = report
+      ? Object.entries(report.summary as Record<string, any>)
+          .map(([species, item]) => ({
+            species,
+            count: Number(item?.headline_count ?? 0),
+            verdict: String(item?.verdict ?? ""),
+            confidence: item?.mean_confidence == null ? null : Number(item.mean_confidence),
+          }))
+          .filter((row) => row.count > 0)
+          .sort((a, b) => b.count - a.count)
+          .slice(0, 3)
+      : null;
+    return {
+      ...f,
+      __stats: stats as PeakStats | null,
+      __modelTop: modelTop as ModelPreview | null,
+    };
+  })
+);
+
+const filteredFiles = enrichedFiles.filter((f) => {
+  if (modelStatusParam === "available" && f.__modelTop == null) return false;
+  if (modelStatusParam === "detected" && (!f.__modelTop || f.__modelTop.length === 0)) return false;
+  if (modelStatusParam === "none" && (!f.__modelTop || f.__modelTop.length > 0)) return false;
+  if (modelSpeciesParam) {
+    const topSpecies = f.__modelTop?.[0]?.species ?? "";
+    if (topSpecies !== modelSpeciesParam) return false;
+  }
+  return true;
 });
 
+const total = usingModelFilters ? filteredFiles.length : await (where ? db.audioFile.count({ where }) : db.audioFile.count());
+const files = usingModelFilters ? filteredFiles.slice(skip, skip + size) : enrichedFiles;
 
   const totalPages = Math.max(1, Math.ceil(total / size));
 
@@ -399,6 +507,8 @@ const files = filesRaw.map((f) => {
       mdFrom: over.mdFrom ?? mdFromParam,
       mdTo:   over.mdTo   ?? mdToParam,
       notSilent: String(over.notSilent ?? notSilentParam),
+      modelStatus: over.modelStatus ?? modelStatusParam,
+      modelSpecies: over.modelSpecies ?? modelSpeciesParam,
     });
     return `/?${s.toString()}`;
   };
@@ -530,6 +640,26 @@ const files = filesRaw.map((f) => {
         </label>
 
         <label className="text-sm">
+          <div className="text-slate-600">Model status</div>
+          <select name="modelStatus" defaultValue={modelStatusParam || ""} className="border rounded px-2 h-8">
+            <option value="">All files</option>
+            <option value="available">Has model result</option>
+            <option value="detected">Model detected species</option>
+            <option value="none">Model says none</option>
+          </select>
+        </label>
+
+        <label className="text-sm">
+          <div className="text-slate-600">Top model species</div>
+          <select name="modelSpecies" defaultValue={modelSpeciesParam || ""} className="border rounded px-2 h-8">
+            <option value="">Any species</option>
+            {MODEL_SPECIES_OPTIONS.map((species) => (
+              <option key={species} value={species}>{formatSpeciesName(species)}</option>
+            ))}
+          </select>
+        </label>
+
+        <label className="text-sm">
           <div className="text-slate-600">Sort by</div>
           <select name="sort" defaultValue={sortKey} className="border rounded px-2 h-8">
             <option value="recordedAt">Recorded time</option>
@@ -585,7 +715,7 @@ const files = filesRaw.map((f) => {
         {siteParam && <> at site <b>{siteParam}</b></>}.
       </div>
       {/* Active filters */}
-        {(q || projectIdFilterAllowed || folderParam || siteParam || hasAbsDates || hasSeason) && (
+        {(q || projectIdFilterAllowed || folderParam || siteParam || hasAbsDates || hasSeason || modelStatusParam || modelSpeciesParam) && (
           <div className="flex flex-wrap gap-2 items-center text-xs text-slate-700">
             <span className="mr-1">Active filters:</span>
 
@@ -601,6 +731,8 @@ const files = filesRaw.map((f) => {
 
             {folderParam && <Chip label="Folder" value={folderParam} href={href({ folder: "" })} />}
             {siteParam && <Chip label="Site" value={siteParam} href={href({ site: "" })} />}
+            {modelStatusParam && <Chip label="Model" value={modelStatusParam} href={href({ modelStatus: "" })} />}
+            {modelSpeciesParam && <Chip label="Top species" value={formatSpeciesName(modelSpeciesParam)} href={href({ modelSpecies: "" })} />}
 
             {hasAbsDates && (
               <Chip label="Date" value={`${fromParam || "…"} → ${toParam || "…"} (UTC)`} href={href({ from: "", to: "" })} />
@@ -611,7 +743,7 @@ const files = filesRaw.map((f) => {
             )}
 
             <Link
-              href={href({ q: "", projectId: "", site: "", folder: "", from: "", to: "", mdFrom: "", mdTo: "" })}
+              href={href({ q: "", projectId: "", site: "", folder: "", from: "", to: "", mdFrom: "", mdTo: "", modelStatus: "", modelSpecies: "" })}
               className="ml-2 text-slate-600 underline hover:text-slate-900"
             >
               Clear all
@@ -639,6 +771,7 @@ const files = filesRaw.map((f) => {
 
                   {/* 👇 new badge */}
                   <ActivityBadge s={f.__stats ?? null} />
+                  <ModelSummaryBadge model={f.__modelTop ?? null} />
 
                   <span
                     className={`rounded-full px-2 py-0.5 text-xs font-medium ${
@@ -661,8 +794,19 @@ const files = filesRaw.map((f) => {
                 {f.lastModifiedAt ? `· modified ${timeAgo(new Date(f.lastModifiedAt))}` : ""}
               </div>
 
+              {f.__modelTop && f.__modelTop.length > 0 && (
+                <div className="mb-2 text-xs text-slate-700">
+                  <span className="font-medium">Model:</span>{" "}
+                  {f.__modelTop.map((row) => `${formatSpeciesName(row.species)} ${row.count} (${confidenceLabel(row.confidence)})`).join(" · ")}
+                </div>
+              )}
+
               <Link className="inline-block text-blue-600 underline" href={`/annotate/${f.id}`}>
                 Annotate
+              </Link>
+              <span className="mx-2 text-slate-300">|</span>
+              <Link className="inline-block text-emerald-700 underline" href={`/model/${f.id}`}>
+                Model results
               </Link>
             </li>
           );
